@@ -47,8 +47,8 @@ impl Default for ChessGui {
         Self {
             white_type: PlayerType::Human,
             black_type: PlayerType::Engine,
-            white_path: "./stockfish".to_owned(),
-            black_path: "./stockfish".to_owned(),
+            white_path: "./chess_engine.exe".to_owned(),
+            black_path: "./chess_engine.exe".to_owned(),
             white_engine: None,
             black_engine: None,
             board: STARTING_BOARD,
