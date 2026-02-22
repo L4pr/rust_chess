@@ -9,3 +9,5 @@ pub use board::move_struct::Move;
 pub use board::castling_rights::CastlingRights;
 pub use move_generation::generate_moves::generate_all_moves;
 pub use engine::Engine;
+pub use move_generation::generate_moves::is_square_attacked;
+pub use move_generation::tests::perft;
