@@ -1,4 +1,4 @@
-use crate::{Move, Piece, CastlingRights, generate_all_moves};
+use crate::{Move, Piece, CastlingRights, generate_all_moves, is_square_attacked};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Board {
@@ -169,7 +169,7 @@ impl Board {
     }
 
     pub fn parse_uci_to_move(&self, uci: &str) -> Option<Move> {
-        let mut move_storage = [Move(0); 256];
+        let mut move_storage = [Move(0); 218];
         let count = generate_all_moves(self, &mut move_storage);
         let legal_moves = &move_storage[..count];
 
@@ -275,6 +275,39 @@ impl Board {
         self.castling_rights.0 &= CASTLING_MASKS[from as usize];
         self.castling_rights.0 &= CASTLING_MASKS[to as usize];
     }
+
+    pub fn is_in_check(&self) -> bool {
+        let us = if self.white_to_move { Piece::WHITE } else { Piece::BLACK };
+        let king_bitboard = self.pieces[(us | Piece::KING) as usize];
+
+        let king_sq = king_bitboard.trailing_zeros() as u8;
+        is_square_attacked(self, king_sq, us ^ 8)
+    }
+
+    pub fn evaluate_board(&self) -> f64 {
+        let mut score = 0.0;
+
+        // Simple piece values
+        let values = [
+            (Piece::PAWN, 100.0),
+            (Piece::KNIGHT, 320.0),
+            (Piece::BISHOP, 330.0),
+            (Piece::ROOK, 500.0),
+            (Piece::QUEEN, 900.0),
+            (Piece::KING, 20000.0),
+        ];
+
+        for (pt, val) in values {
+            let white_count = self.pieces[(Piece::WHITE | pt) as usize].count_ones() as f64;
+            let black_count = self.pieces[(Piece::BLACK | pt) as usize].count_ones() as f64;
+            score += (white_count - black_count) * val;
+        }
+
+        // Return score from the perspective of the side whose turn it is
+        if self.white_to_move { score } else { -score }
+    }
+
+    
 }
 
 const CASTLING_MASKS: [u8; 64] = [

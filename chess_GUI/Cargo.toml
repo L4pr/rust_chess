@@ -5,3 +5,4 @@ edition = "2024"
 
 [dependencies]
 eframe = "0.33.3"
+chess_engine = { path = "../chess_engine" }

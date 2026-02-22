@@ -11,3 +11,4 @@ pub use move_generation::generate_moves::generate_all_moves;
 pub use engine::Engine;
 pub use move_generation::generate_moves::is_square_attacked;
 pub use move_generation::tests::perft;
+pub use board::zobrist::ZobristKeys;

@@ -1,6 +1,7 @@
 use std::io::{self, BufRead};
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::thread;
+use std::time::Duration;
 use chess_engine::{Board, Engine};
 
 
@@ -41,13 +42,26 @@ fn main() {
                 // Reset the abort flag
                 abort_search.store(false, Ordering::Relaxed);
 
-                let state_clone = board.clone();
+                let move_time = parts.iter()
+                    .position(|&r| r == "movetime")
+                    .and_then(|i| parts.get(i + 1))
+                    .and_then(|t| t.parse::<u64>().ok())
+                    .unwrap_or(1000);
+
                 let abort_clone = Arc::clone(&abort_search);
 
-                // SPAWN A THREAD! The main thread must immediately go back
-                // to listening to stdin in case the GUI sends "stop".
                 thread::spawn(move || {
-                    calculate_best_move(state_clone, abort_clone);
+                    // Give the engine a 50ms buffer to finish its last node and print
+                    let sleep_duration = if move_time > 50 { move_time - 50 } else { move_time };
+                    thread::sleep(Duration::from_millis(sleep_duration));
+                    abort_clone.store(true, Ordering::Relaxed);
+                });
+
+                let board_clone = board.clone();
+                let abort_for_search = Arc::clone(&abort_search);
+
+                thread::spawn(move || {
+                    calculate_best_move(board_clone, abort_for_search);
                 });
             }
             // 6. GUI says: "Stop calculating immediately and give me your best guess!"
@@ -89,7 +103,6 @@ fn parse_position(board: &mut Board, parts: Vec<&str>, cmd: &str) {
 fn calculate_best_move(board: Board, abort: Arc<AtomicBool>) {
     let mut engine = Engine::new();
     engine.set_board(board);
-    let bestmove = engine.think(1000, abort).unwrap();
-    // TODO: Implement a real search algorithm here (e.g., Minimax with alpha-beta pruning).
+    let bestmove = engine.think(abort).unwrap();
     println!("bestmove {}", bestmove.to_uci());
 }

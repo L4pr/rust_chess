@@ -351,7 +351,6 @@ pub const KNIGHT_MOVES: [u64; 64] = {
     let mut table = [0u64; 64];
     let mut sq = 0;
     while sq < 64 {
-        let bit = 1u64 << sq;
         let mut moves = 0u64;
         let start_file = (sq % 8) as i8;
 
