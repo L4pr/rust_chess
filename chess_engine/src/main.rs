@@ -1,19 +1,14 @@
-mod board;
-mod move_generation;
-mod engine;
-
 use std::io::{self, BufRead};
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::thread;
+use chess_engine::{Board, Engine};
 
-use board::*;
-use engine::*;
 
 fn main() {
     // This flag allows the main loop to tell the search thread to stop!
     let abort_search = Arc::new(AtomicBool::new(false));
     let mut board = Board::starting_position();
-
+    
     let stdin = io::stdin();
     for line in stdin.lock().lines() {
         let cmd = line.expect("Failed to read line").trim().to_string();
@@ -81,13 +76,20 @@ fn parse_position(board: &mut Board, parts: Vec<&str>, cmd: &str) {
     if new_parts.len() > 1 {
         let moves_str = new_parts[1].trim();
         for move_str in moves_str.split_whitespace() {
-            // TODO: We need to parse the move string (e.g., "e2e4") and update the board state accordingly.
+            if let Some(m) = board.parse_uci_to_move(move_str) {
+                board.make_move(m);
+            } else {
+                eprintln!("info string Error: Illegal move received: {}", move_str);
+            }
         }
     }
 }
 
 /// DUMMY FUNCTION: The actual chess math.
 fn calculate_best_move(board: Board, abort: Arc<AtomicBool>) {
+    let mut engine = Engine::new();
+    engine.set_board(board);
+    let bestmove = engine.think(1000, abort).unwrap();
     // TODO: Implement a real search algorithm here (e.g., Minimax with alpha-beta pruning).
-    println!("bestmove e2e4");
+    println!("bestmove {}", bestmove.to_uci());
 }

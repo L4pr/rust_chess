@@ -47,8 +47,8 @@ impl Default for ChessGui {
         Self {
             white_type: PlayerType::Human,
             black_type: PlayerType::Engine,
-            white_path: "./chess_engine.exe".to_owned(),
-            black_path: "./chess_engine.exe".to_owned(),
+            white_path: "./target/debug/chess_engine.exe".to_owned(),
+            black_path: "./target/debug/chess_engine.exe".to_owned(),
             white_engine: None,
             black_engine: None,
             board: STARTING_BOARD,
@@ -62,14 +62,21 @@ impl Default for ChessGui {
 impl ChessGui {
     /// Spawns an engine and returns its data wrapper
     fn spawn_engine(path: &str) -> Option<EngineData> {
-        let mut child = Command::new(path)
+        let spawn_result = Command::new(path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .spawn()
-            .ok()?;
+            .spawn();
 
-        let stdout = child.stdout.take().unwrap();
-        let mut stdin = child.stdin.take().unwrap();
+        let mut child = match spawn_result {
+            Ok(child) => child,
+            Err(e) => {
+                eprintln!("CRITICAL ERROR: Could not start engine at [{}]. System error: {}", path, e);
+                return None;
+            }
+        };
+
+        let stdout = child.stdout.take().expect("Failed to open stdout");
+        let mut stdin = child.stdin.take().expect("Failed to open stdin");
 
         let (tx, rx) = channel();
         thread::spawn(move || {
@@ -83,6 +90,7 @@ impl ChessGui {
 
         // Initialize UCI mode
         let _ = stdin.write_all(b"uci\n");
+        let _ = stdin.write_all(b"isready\n");
 
         Some(EngineData {
             stdin,
@@ -94,8 +102,8 @@ impl ChessGui {
     /// Sends a command to a specific engine
     fn send_to_engine(engine: &mut Option<EngineData>, cmd: &str) {
         if let Some(eng) = engine {
-            let command = format!("{}\n", cmd);
-            let _ = eng.stdin.write_all(command.as_bytes());
+            let _ = writeln!(eng.stdin, "{}", cmd); // writeln! adds the \n automatically
+            let _ = eng.stdin.flush(); // Force the bytes out of the buffer and into the engine
             eng.log.push(format!("> {}", cmd));
         }
     }

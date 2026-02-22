@@ -61,4 +61,29 @@ impl Move {
     pub fn is_promotion(&self) -> bool {
         self.flags() >= Self::PR_KNIGHT
     }
+
+    pub fn to_uci(&self) -> String {
+        let from = self.from_sq();
+        let to = self.to_sq();
+
+        let from_file = (b'a' + (from % 8)) as char;
+        let from_rank = (b'1' + (from / 8)) as char;
+        let to_file   = (b'a' + (to % 8)) as char;
+        let to_rank   = (b'1' + (to / 8)) as char;
+
+        let mut uci = format!("{}{}{}{}", from_file, from_rank, to_file, to_rank);
+
+        // Append promotion character if necessary
+        if self.is_promotion() {
+            let promo_char = match self.flags() {
+                Self::PR_KNIGHT | Self::PC_KNIGHT => 'n',
+                Self::PR_BISHOP | Self::PC_BISHOP => 'b',
+                Self::PR_ROOK   | Self::PC_ROOK   => 'r',
+                _ => 'q', // Default to queen
+            };
+            uci.push(promo_char);
+        }
+
+        uci
+    }
 }

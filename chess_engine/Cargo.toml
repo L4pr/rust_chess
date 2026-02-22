@@ -3,4 +3,16 @@ name = "chess_engine"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "chess_engine"
+path = "src/lib.rs"
+
 [dependencies]
+rand = "0.10.0"
+
+[dev-dependencies]
+criterion = { version = "0.8.2", features = ["html_reports"] }
+
+[[bench]]
+name = "move_gen_bench"
+harness = false

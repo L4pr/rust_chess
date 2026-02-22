@@ -1,6 +1,4 @@
 pub mod board;
 pub mod pieces;
-pub(crate) mod move_struct;
-mod castling_rights;
-
-pub use board::*;
+pub mod move_struct;
+pub mod castling_rights;
