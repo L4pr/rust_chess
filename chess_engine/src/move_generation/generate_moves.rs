@@ -95,8 +95,35 @@ fn push_promotions(moves: &mut [Move], index: &mut usize, from: u8, to: u8, capt
 }
 
 fn generate_knight_moves(board: &Board, moves: &mut [Move], curr_move_index: &mut usize) {
+    let us = if board.white_to_move { Piece::WHITE } else { Piece::BLACK };
+    let mut knights = board.pieces[(us | Piece::KNIGHT) as usize];
 
+    while knights != 0 {
+        let from = knights.trailing_zeros() as u8;
 
+        // 1. Get all potential moves for this square
+        // 2. Filter out squares occupied by our own pieces (& !friendly_occ)
+        let mut attacks = KNIGHT_MOVES[from as usize] & !board.pieces[(us | Piece::ALL) as usize];
+
+        while attacks != 0 {
+            let to = attacks.trailing_zeros() as u8;
+            let to_bit = 1u64 << to;
+
+            // Determine if it's a capture for the Move flag
+            let enemy_occ = board.pieces[((us ^ 8) | Piece::ALL) as usize];
+            let flag = if (to_bit & enemy_occ) != 0 {
+                Move::CAPTURE
+            } else {
+                Move::QUIET
+            };
+
+            moves[*curr_move_index] = Move::new_with_flags(from, to, flag);
+            *curr_move_index += 1;
+
+            attacks &= attacks - 1; // Clear processed bit
+        }
+        knights &= knights - 1; // Clear processed knight
+    }
 }
 
 fn generate_bishop_moves(board: &Board, moves: &mut [Move], curr_move_index: &mut usize) {
@@ -118,3 +145,39 @@ fn generate_king_moves(board: &Board, moves: &mut [Move], curr_move_index: &mut 
 
 
 }
+
+pub const KNIGHT_MOVES: [u64; 64] = {
+    let mut table = [0u64; 64];
+    let mut sq = 0;
+    while sq < 64 {
+        let bit = 1u64 << sq;
+        let mut moves = 0u64;
+        let start_file = (sq % 8) as i8;
+
+        // The 8 possible bit-shift offsets for a Knight
+        // Positive = Up/Right, Negative = Down/Left
+        let offsets: [i8; 8] = [17, 15, 10, 6, -17, -15, -10, -6];
+
+        let mut i = 0;
+        while i < 8 {
+            let offset = offsets[i];
+            let target_sq = sq as i8 + offset;
+
+            // 1. Check if the square is even on the 0-63 board
+            if target_sq >= 0 && target_sq < 64 {
+                let target_file = (target_sq % 8) as i8;
+
+                // A knight move can never change more than 2 files.
+                // If it changed 7 files (e.g. from A to H), it wrapped.
+                if (target_file - start_file).abs() <= 2 {
+                    moves |= 1u64 << target_sq as u8;
+                }
+            }
+            i += 1;
+        }
+
+        table[sq as usize] = moves;
+        sq += 1;
+    }
+    table
+};
