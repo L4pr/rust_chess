@@ -123,7 +123,7 @@ impl ChessGui {
         }
     }
 
-    fn spawn_engine(path: &str) -> Option<EngineData> {
+    fn spawn_engine(path: &str, ctx: egui::Context) -> Option<EngineData> {
         let mut child = Command::new(path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -139,6 +139,8 @@ impl ChessGui {
             for line in reader.lines() {
                 if let Ok(msg) = line {
                     if tx.send(msg).is_err() { break; }
+
+                    ctx.request_repaint();
                 }
             }
         });
@@ -173,9 +175,11 @@ impl ChessGui {
 
     fn process_engine_messages(&mut self, ctx: &egui::Context) {
         let mut bestmove = None;
+        let mut needs_repaint = false;
         if let Some(eng) = &mut self.white_engine {
             while let Ok(msg) = eng.receiver.try_recv() {
                 eng.log.push(msg.clone());
+                needs_repaint = true;
                 if msg.starts_with("bestmove") {
                     bestmove = msg.split_whitespace().nth(1).map(|s| s.to_string());
                 }
@@ -184,6 +188,7 @@ impl ChessGui {
         if let Some(eng) = &mut self.black_engine {
             while let Ok(msg) = eng.receiver.try_recv() {
                 eng.log.push(msg.clone());
+                needs_repaint = true;
                 if msg.starts_with("bestmove") {
                     bestmove = msg.split_whitespace().nth(1).map(|s| s.to_string());
                 }
@@ -191,6 +196,10 @@ impl ChessGui {
         }
         if let Some(m) = bestmove {
             self.apply_move(&m);
+            needs_repaint = true;
+        }
+
+        if needs_repaint {
             ctx.request_repaint();
         }
     }
@@ -219,7 +228,7 @@ impl eframe::App for ChessGui {
                         ui.text_edit_singleline(&mut self.white_path);
                         ui.end_row();
                         if ui.button("Connect White").clicked() {
-                            self.white_engine = ChessGui::spawn_engine(&self.white_path);
+                            self.white_engine = ChessGui::spawn_engine(&self.white_path, ctx.clone());
                             // Auto-trigger if it's White's turn
                             if self.board_state.white_to_move { self.trigger_active_engine(); }
                         }
@@ -243,7 +252,7 @@ impl eframe::App for ChessGui {
                         ui.text_edit_singleline(&mut self.black_path);
                         ui.end_row();
                         if ui.button("Connect Black").clicked() {
-                            self.black_engine = ChessGui::spawn_engine(&self.black_path);
+                            self.black_engine = ChessGui::spawn_engine(&self.black_path, ctx.clone());
                             // Auto-trigger if it's Black's turn
                             if !self.board_state.white_to_move { self.trigger_active_engine(); }
                         }
@@ -327,5 +336,9 @@ impl eframe::App for ChessGui {
 }
 
 fn main() -> Result<(), eframe::Error> {
-    eframe::run_native("Rust Chess Arena", eframe::NativeOptions::default(), Box::new(|_| Ok(Box::<ChessGui>::default())))
+    let mut options = eframe::NativeOptions::default();
+    options.viewport = egui::ViewportBuilder::default()
+        .with_inner_size([1200.0, 800.0]);
+
+    eframe::run_native("Rust Chess Arena", options, Box::new(|_| Ok(Box::<ChessGui>::default())))
 }

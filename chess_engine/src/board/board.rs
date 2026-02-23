@@ -168,6 +168,22 @@ impl Board {
         fen
     }
 
+    pub fn to_book_fen(&self) -> String {
+        let full_fen = self.get_fen();
+
+        // Split the FEN into its individual parts
+        let parts: Vec<&str> = full_fen.split_whitespace().collect();
+
+        // Safety check to ensure the FEN is valid before we access indices
+        if parts.len() >= 3 {
+            // Rebuild the string using the first 3 parts, and force En Passant to "-"
+            format!("{} {} {} -", parts[0], parts[1], parts[2])
+        } else {
+            // Fallback just in case get_fen() returns something weird
+            full_fen
+        }
+    }
+
     pub fn parse_uci_to_move(&self, uci: &str) -> Option<Move> {
         let mut move_storage = [Move(0); 218];
         let count = generate_all_moves(self, &mut move_storage);
@@ -307,7 +323,7 @@ impl Board {
         if self.white_to_move { score } else { -score }
     }
 
-    
+
 }
 
 const CASTLING_MASKS: [u8; 64] = [

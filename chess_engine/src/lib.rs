@@ -12,3 +12,4 @@ pub use engine::Engine;
 pub use move_generation::generate_moves::is_square_attacked;
 pub use move_generation::tests::perft;
 pub use board::zobrist::ZobristKeys;
+pub use move_generation::book::OpeningBook;

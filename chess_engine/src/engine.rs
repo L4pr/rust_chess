@@ -1,20 +1,41 @@
+use std::env;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use crate::{Board, Move, generate_all_moves, is_square_attacked, Piece, ZobristKeys};
+use crate::{Board, Move, generate_all_moves, is_square_attacked, Piece, ZobristKeys, OpeningBook};
 
 pub struct Engine {
     board: Board,
     zobrist: ZobristKeys,
     tt: TranspositionTable,
+    book: OpeningBook,
 }
 
 impl Engine {
     pub fn new() -> Self {
+        let mut book_path = std::path::PathBuf::from("Book.txt");
+
+        if let Ok(mut exe_path) = env::current_exe() {
+            exe_path.pop();
+            exe_path.pop();
+            exe_path.pop();
+            exe_path.push("chess_engine");
+            exe_path.push("resources");
+            exe_path.push("Book.txt");
+            book_path = exe_path; // Now it points exactly to the release folder!
+        }
+
+        let book = OpeningBook::load_from_file(book_path.to_str().unwrap()).unwrap();
+
         Engine {
             board: Board::starting_position(),
             zobrist: ZobristKeys::new(),
             tt: TranspositionTable::new(64), // 64 MB transposition table
+            book,
         }
+    }
+
+    pub fn clear_tt(&mut self) {
+        self.tt = TranspositionTable::new(64); // Clear the TT by creating a new one
     }
 
     pub fn set_board(&mut self, new_board: Board) {
@@ -22,7 +43,17 @@ impl Engine {
     }
 
     pub fn think(&mut self, abort: Arc<AtomicBool>) -> Option<Move> {
-        let mut move_storage = [Move::new(0, 0); 256];
+        let book_fen = self.board.to_book_fen();
+
+        if let Some(book_move_str) = self.book.get_book_move(&book_fen) {
+            println!("info string Playing book move!");
+            if !abort.load(Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_millis(400));
+            }
+            return self.board.parse_uci_to_move(&book_move_str);
+        }
+
+        let mut move_storage = [Move::new(0, 0); 218];
         let count = generate_all_moves(&self.board, &mut move_storage);
 
         let us = if self.board.white_to_move { Piece::WHITE } else { Piece::BLACK };
@@ -40,12 +71,15 @@ impl Engine {
             if king_bit != 0 {
                 let king_sq = king_bit.trailing_zeros() as u8;
                 if !is_square_attacked(&test_board, king_sq, enemy) {
-                    root_moves.push(RootMove { m, score: f64::NEG_INFINITY });
+                    root_moves.push(RootMove { m, score: score_move(m, &self.board, None) as f64 });
                 }
             }
         }
 
         let mut nodes = 0;
+
+        let mut absolute_best_move = root_moves[0].m;
+        let mut absolute_best_score = f64::NEG_INFINITY;
 
         for depth in 1..25 { // Iterative Deepening
 
@@ -58,6 +92,9 @@ impl Engine {
 
             // We need to track if we should break completely out of the depth
             let mut search_aborted = false;
+
+            let mut current_depth_best_move = root_moves[0].m;
+            let mut current_depth_best_score = f64::NEG_INFINITY;
 
             for i in 0..root_moves.len() {
                 let m = root_moves[i].m;
@@ -73,7 +110,7 @@ impl Engine {
                 if is_square_attacked(&new_board, king_sq, enemy) { continue; }
 
                 // 3. Search the move (Now passing TT and Zobrist!)
-                let score = -alpha_beta(&new_board, -beta, -alpha, depth - 1, &abort, &mut nodes, &mut self.tt, &self.zobrist);
+                let score = -alpha_beta(&new_board, -beta, -alpha, depth - 1, 1, &abort, &mut nodes, &mut self.tt, &self.zobrist);
 
                 if abort.load(Ordering::Relaxed) {
                     search_aborted = true;
@@ -83,12 +120,25 @@ impl Engine {
                 // 4. Update the exact score for THIS specific move so we can sort it next depth
                 root_moves[i].score = score;
 
+                if score > current_depth_best_score {
+                    current_depth_best_score = score;
+                    current_depth_best_move = m;
+                }
+
                 if score > alpha {
                     alpha = score;
                 }
             }
 
-            if search_aborted { break; }
+            if search_aborted {
+                // If this partial depth just found a move that is STRICTLY BETTER
+                // than the best score from the last fully completed depth, it's safe to harvest it!
+                if current_depth_best_score > absolute_best_score {
+                    absolute_best_move = current_depth_best_move;
+                }
+
+                break;
+            }
 
             // Because we sorted the array at the start, and updated scores,
             // the best move of this depth will be sorted to index 0 on the next loop!
@@ -96,27 +146,27 @@ impl Engine {
 
             // (We have to re-find the max here just for the print, because the scores
             // just updated and aren't sorted again until the next depth starts)
-            if let Some(best_root_move) = root_moves.iter().max_by(|a, b| a.score.partial_cmp(&b.score).unwrap()) {
-                println!("info depth {} score cp {} nodes {} pv {}",
-                         depth,
-                         best_root_move.score as i32,
-                         nodes,
-                         best_root_move.m.to_uci()
-                );
-            }
+            absolute_best_move = current_depth_best_move;
+            absolute_best_score = current_depth_best_score;
+
+            println!("info depth {} score cp {} nodes {} pv {}",
+                     depth,
+                     absolute_best_score as i32,
+                     nodes,
+                     absolute_best_move.to_uci()
+            );
         }
 
-        // When time runs out, the best move from the last fully completed depth
-        // is sitting at index 0 (because it was sorted at the top of the loop!)
-        Some(root_moves.iter().max_by(|a, b| a.score.partial_cmp(&b.score).unwrap()).unwrap().m)
+        Some(absolute_best_move)
     }
 }
 
-fn alpha_beta(
+pub fn alpha_beta(
     board: &Board,
     mut alpha: f64,
     mut beta: f64, // Needs to be mut now so we can update it from the TT
     depth: u32,
+    ply: u32,
     abort: &Arc<AtomicBool>,
     nodes: &mut u64,
     tt: &mut TranspositionTable,
@@ -128,19 +178,35 @@ fn alpha_beta(
         return 0.0;
     }
 
+    if ply >= 90 {
+        println!("info string Reached ply {}, something is probably wrong. Aborting search.", ply);
+        return board.evaluate_board();
+    }
+
     // --- TT PROBE START ---
     let original_alpha = alpha;
     let hash_key = zobrist.hash(board);
 
+    let mut tt_move = None;
+
     if let Some(entry) = tt.probe(hash_key) {
+        tt_move = entry.best_move;
+
         if entry.depth >= depth {
+            let mut tt_score = entry.score;
+            if tt_score > 9000.0 {
+                tt_score -= ply as f64;
+            } else if tt_score < -9000.0 {
+                tt_score += ply as f64;
+            }
+
             match entry.flag {
-                TTFlag::Exact => return entry.score,
-                TTFlag::LowerBound => alpha = alpha.max(entry.score),
-                TTFlag::UpperBound => beta = beta.min(entry.score),
+                TTFlag::Exact => return tt_score,
+                TTFlag::LowerBound => alpha = alpha.max(tt_score),
+                TTFlag::UpperBound => beta = beta.min(tt_score),
             }
             if alpha >= beta {
-                return entry.score;
+                return tt_score;
             }
         }
     }
@@ -148,12 +214,17 @@ fn alpha_beta(
 
     // 2. Base Case: Leaf Node
     if depth == 0 {
-        return quiescence_search(board, alpha, beta, abort, nodes, tt, zobrist);
+        return board.evaluate_board();
     }
 
     // 3. Generate and Sort Moves
     let mut move_storage = [Move(0); 218];
     let count = generate_all_moves(board, &mut move_storage);
+
+    let mut scores = [0i32; 218];
+    for i in 0..count {
+        scores[i] = score_move(move_storage[i], board, tt_move);
+    }
 
     let us = if board.white_to_move { Piece::WHITE } else { Piece::BLACK };
     let enemy = us ^ 8;
@@ -163,6 +234,15 @@ fn alpha_beta(
     let mut best_move = None;
 
     for i in 0..count {
+        let mut best_idx = i;
+        for j in (i + 1)..count {
+            if scores[j] > scores[best_idx] {
+                best_idx = j;
+            }
+        }
+        move_storage.swap(i, best_idx);
+        scores.swap(i, best_idx);
+
         let m = move_storage[i];
         let mut new_board = *board;
         new_board.make_move(m);
@@ -176,9 +256,25 @@ fn alpha_beta(
 
         legal_moves += 1;
 
+        let mut extension = 0;
+
+        let enemy_king_bit = new_board.pieces[(enemy | Piece::KING) as usize];
+        if enemy_king_bit != 0 {
+            let enemy_king_sq = enemy_king_bit.trailing_zeros() as u8;
+            if is_square_attacked(&new_board, enemy_king_sq, us) {
+                extension = 1;
+            } else if m.is_capture() {
+                // extension = 1;
+            }
+        }
+
         // Recursively call with -beta and -alpha (Negamax style)
         // This flips the perspective for the other player
-        let score = -alpha_beta(&new_board, -beta, -alpha, depth - 1, abort, nodes, tt, zobrist);
+        let score = -alpha_beta(&new_board, -beta, -alpha, depth - 1 + extension, ply + 1, abort, nodes, tt, zobrist);
+
+        if abort.load(Ordering::Relaxed) {
+            return 0.0;
+        }
 
         if score > best_score {
             best_score = score;
@@ -187,8 +283,14 @@ fn alpha_beta(
 
         if score >= beta {
             // STORE BEFORE RETURNING!
-            tt.store(hash_key, depth, best_score, TTFlag::LowerBound, best_move);
-            return beta; // Beta Cutoff: This branch is too good for the opponent to allow
+            let mut store_score = best_score;
+            if store_score > 9000.0 {
+                store_score += ply as f64;
+            } else if store_score < -9000.0 {
+                store_score -= ply as f64;
+            }
+            tt.store(hash_key, depth, store_score, TTFlag::LowerBound, best_move);
+            return best_score;
         }
         if score > alpha {
             alpha = score; // This is our new best move
@@ -200,12 +302,19 @@ fn alpha_beta(
         let king_bit = board.pieces[(us | Piece::KING) as usize];
         let king_sq = king_bit.trailing_zeros() as u8;
         best_score = if is_square_attacked(board, king_sq, enemy) {
-            -10000.0 - (depth as f64) // Checkmate (prefer faster mates)
+            -10000.0 + (ply as f64) // Checkmate (prefer faster mates)
         } else {
             0.0 // Stalemate
         };
 
-        tt.store(hash_key, depth, best_score, TTFlag::Exact, None);
+        let mut store_score = best_score;
+        if store_score > 9000.0 {
+            store_score += ply as f64;
+        } else if store_score < -9000.0 {
+            store_score -= ply as f64;
+        }
+
+        tt.store(hash_key, depth, store_score, TTFlag::Exact, None);
         return best_score;
     }
 
@@ -222,111 +331,27 @@ fn alpha_beta(
     alpha
 }
 
-pub fn quiescence_search(
-    board: &Board,
-    mut alpha: f64,
-    mut beta: f64, // Mutated by TT probe
-    abort: &Arc<AtomicBool>,
-    nodes: &mut u64,
-    tt: &mut TranspositionTable, // Added
-    zobrist: &ZobristKeys,       // Added
-) -> f64 {
-    // 1. Abort check
-    *nodes += 1;
-    if *nodes & 1023 == 0 && abort.load(Ordering::Relaxed) {
-        return 0.0;
+fn score_move(m: Move, _board: &Board, tt_move: Option<Move>) -> i32 {
+    // 1. Highest Priority: The move from the Transposition Table
+    if Some(m) == tt_move {
+        return 10_000;
     }
 
-    // --- TT PROBE START ---
-    let original_alpha = alpha;
-    let hash_key = zobrist.hash(board);
+    let mut score = 0;
 
-    // In QS, we don't need to check if entry.depth >= depth,
-    // because any entry in the TT is at least depth 0 (QS level).
-    if let Some(entry) = tt.probe(hash_key) {
-        match entry.flag {
-            TTFlag::Exact => return entry.score,
-            TTFlag::LowerBound => alpha = alpha.max(entry.score),
-            TTFlag::UpperBound => beta = beta.min(entry.score),
-        }
-        if alpha >= beta {
-            return entry.score;
-        }
-    }
-    // --- TT PROBE END ---
-
-    // 2. The "Stand Pat" Score
-    let stand_pat = board.evaluate_board();
-
-    if stand_pat >= beta {
-        // STORE BEFORE RETURNING!
-        tt.store(hash_key, 0, stand_pat, TTFlag::LowerBound, None);
-        return beta;
+    // 2. High Priority: Captures
+    // (Later you can upgrade this to MVV-LVA: Most Valuable Victim, Least Valuable Attacker) TODO
+    if m.is_capture() {
+        score += 1_000;
     }
 
-    if stand_pat > alpha {
-        alpha = stand_pat;
+    // 3. Medium Priority: Promotions
+    if m.is_promotion() {
+        score += 900;
     }
 
-    // We track the best score for the TT.
-    // In QS, our "worst case" is just standing pat!
-    let mut best_score = stand_pat;
-
-    // 3. Generate ONLY Captures
-    let mut move_storage = [Move::new(0, 0); 256];
-    let count = generate_all_moves(board, &mut move_storage);
-
-    let mut captures = Vec::with_capacity(count);
-    for i in 0..count {
-        let m = move_storage[i];
-        if m.is_capture() {
-            captures.push(m);
-        }
-    }
-
-    let us = if board.white_to_move { Piece::WHITE } else { Piece::BLACK };
-    let enemy = us ^ 8;
-
-    // 4. Search the Captures
-    for m in captures {
-        let mut new_board = *board;
-        new_board.make_move(m);
-
-        let king_bit = new_board.pieces[(us | Piece::KING) as usize];
-        if king_bit == 0 { continue; }
-        let king_sq = king_bit.trailing_zeros() as u8;
-        if is_square_attacked(&new_board, king_sq, enemy) {
-            continue;
-        }
-
-        // Pass TT and Zobrist recursively!
-        let score = -quiescence_search(&new_board, -beta, -alpha, abort, nodes, tt, zobrist);
-
-        if score > best_score {
-            best_score = score;
-        }
-
-        if score >= beta {
-            // STORE BEFORE RETURNING!
-            tt.store(hash_key, 0, beta, TTFlag::LowerBound, Some(m));
-            return beta;
-        }
-        if score > alpha {
-            alpha = score;
-        }
-    }
-
-    // --- TT STORE START ---
-    let tt_flag = if best_score <= original_alpha {
-        TTFlag::UpperBound
-    } else {
-        TTFlag::Exact
-    };
-
-    tt.store(hash_key, 0, best_score, tt_flag, None);
-    // --- TT STORE END ---
-
-    alpha
+    // Quiet moves get a score of 0
+    score
 }
 
 #[derive(Copy, Clone)]

@@ -1,11 +1,12 @@
 use std::io::{self, BufRead};
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}, Mutex};
 use std::thread;
 use std::time::Duration;
 use chess_engine::{Board, Engine};
 
 
 fn main() {
+    let engine = Arc::new(Mutex::new(Engine::new()));
     // This flag allows the main loop to tell the search thread to stop!
     let abort_search = Arc::new(AtomicBool::new(false));
     let mut board = Board::starting_position();
@@ -30,6 +31,7 @@ fn main() {
             }
             // 3. GUI says: "Start a new game."
             "ucinewgame" => {
+                engine.lock().unwrap().clear_tt();
                 board = Board::starting_position();
             }
             // 4. GUI says: "Here is the current board."
@@ -59,9 +61,13 @@ fn main() {
 
                 let board_clone = board.clone();
                 let abort_for_search = Arc::clone(&abort_search);
+                let engine_clone = Arc::clone(&engine);
 
                 thread::spawn(move || {
-                    calculate_best_move(board_clone, abort_for_search);
+                    let mut eng = engine_clone.lock().unwrap();
+                    eng.set_board(board_clone);
+                    let bestmove = eng.think(abort_for_search).unwrap();
+                    println!("bestmove {}", bestmove.to_uci());
                 });
             }
             // 6. GUI says: "Stop calculating immediately and give me your best guess!"
@@ -97,12 +103,4 @@ fn parse_position(board: &mut Board, parts: Vec<&str>, cmd: &str) {
             }
         }
     }
-}
-
-/// DUMMY FUNCTION: The actual chess math.
-fn calculate_best_move(board: Board, abort: Arc<AtomicBool>) {
-    let mut engine = Engine::new();
-    engine.set_board(board);
-    let bestmove = engine.think(abort).unwrap();
-    println!("bestmove {}", bestmove.to_uci());
 }
