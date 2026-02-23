@@ -1,4 +1,4 @@
-use crate::{Move, Piece, CastlingRights, generate_all_moves, is_square_attacked};
+use crate::{Move, Piece, CastlingRights, generate_all_moves, is_square_attacked, evaluate};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Board {
@@ -301,26 +301,7 @@ impl Board {
     }
 
     pub fn evaluate_board(&self) -> f64 {
-        let mut score = 0.0;
-
-        // Simple piece values
-        let values = [
-            (Piece::PAWN, 100.0),
-            (Piece::KNIGHT, 320.0),
-            (Piece::BISHOP, 330.0),
-            (Piece::ROOK, 500.0),
-            (Piece::QUEEN, 900.0),
-            (Piece::KING, 20000.0),
-        ];
-
-        for (pt, val) in values {
-            let white_count = self.pieces[(Piece::WHITE | pt) as usize].count_ones() as f64;
-            let black_count = self.pieces[(Piece::BLACK | pt) as usize].count_ones() as f64;
-            score += (white_count - black_count) * val;
-        }
-
-        // Return score from the perspective of the side whose turn it is
-        if self.white_to_move { score } else { -score }
+        evaluate(self)
     }
 
 
