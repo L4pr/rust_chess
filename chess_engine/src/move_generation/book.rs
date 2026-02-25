@@ -1,6 +1,4 @@
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::{self, BufRead};
 use rand::{RngExt};
 
 #[derive(Clone)]
@@ -9,23 +7,21 @@ pub struct BookMove {
     pub weight: u32,
 }
 
+const BOOK_DATA: &str = include_str!("../../resources/Book.txt");
+
 pub struct OpeningBook {
     positions: HashMap<String, Vec<BookMove>>,
 }
 
 impl OpeningBook {
     /// Loads the book from your specific text format
-    pub fn load_from_file(file_path: &str) -> io::Result<Self> {
-        let file = File::open(file_path)?;
-        let reader = io::BufReader::new(file);
-
+    pub fn load_from_file() -> Self {
         let mut positions: HashMap<String, Vec<BookMove>> = HashMap::new();
         let mut current_fen = String::new();
 
         println!("info string loading positions from book.");
 
-        for line in reader.lines() {
-            let line = line?;
+        for line in BOOK_DATA.lines() {
             let line = line.trim();
             if line.is_empty() { continue; }
 
@@ -49,7 +45,7 @@ impl OpeningBook {
         }
 
         println!("info string Loaded {} positions from book.", positions.len());
-        Ok(Self { positions })
+        Self { positions }
     }
 
     /// Picks a move based on weighted randomness

@@ -1,4 +1,3 @@
-use std::env;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use crate::{Board, Move, generate_all_moves, is_square_attacked, Piece, ZobristKeys, OpeningBook};
@@ -12,19 +11,7 @@ pub struct Engine {
 
 impl Engine {
     pub fn new() -> Self {
-        let mut book_path = std::path::PathBuf::from("Book.txt");
-
-        if let Ok(mut exe_path) = env::current_exe() {
-            exe_path.pop();
-            exe_path.pop();
-            exe_path.pop();
-            exe_path.push("chess_engine");
-            exe_path.push("resources");
-            exe_path.push("Book.txt");
-            book_path = exe_path; // Now it points exactly to the release folder!
-        }
-
-        let book = OpeningBook::load_from_file(book_path.to_str().unwrap()).unwrap();
+        let book = OpeningBook::load_from_file();
 
         Engine {
             board: Board::starting_position(),
@@ -80,6 +67,8 @@ impl Engine {
 
         let mut absolute_best_move = root_moves[0].m;
         let mut absolute_best_score = f64::NEG_INFINITY;
+
+        let mut depth_searched = 0;
 
         for depth in 1..25 { // Iterative Deepening
 
@@ -149,13 +138,27 @@ impl Engine {
             absolute_best_move = current_depth_best_move;
             absolute_best_score = current_depth_best_score;
 
-            println!("info depth {} score cp {} nodes {} pv {}",
-                     depth,
-                     absolute_best_score as i32,
-                     nodes,
-                     absolute_best_move.to_uci()
-            );
+            depth_searched = depth;
+
+            if absolute_best_score > 9000.0 {
+                break;
+            }
         }
+
+        let score_to_print = if absolute_best_score > 9000.0 {
+            format!("mate {}", ((10000.0 - absolute_best_score) / 2.0).ceil())
+        } else if absolute_best_score < -9000.0 {
+            format!("mate -{}", ((10000.0 + absolute_best_score) / 2.0).ceil())
+        } else {
+            format!("cp {}", absolute_best_score as i32)
+        };
+
+        println!("info depth {} score {} nodes {} pv {}",
+                 depth_searched,
+                 score_to_print,
+                 nodes,
+                 absolute_best_move.to_uci()
+        );
 
         Some(absolute_best_move)
     }
