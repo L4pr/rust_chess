@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use chess_engine::{Board, perft, ZobristKeys};
 use chess_engine::engine::{alpha_beta, TranspositionTable};
+use chess_engine::move_generation::tests::perft2;
 
 fn bench_pawn_generation(crit: &mut Criterion) {
     let mut board = Board::starting_position();
@@ -12,6 +13,13 @@ fn bench_pawn_generation(crit: &mut Criterion) {
         b.iter(|| {
             // black_box prevents the compiler from optimizing the code away
             perft(black_box(&mut board), 5)
+        })
+    });
+
+    crit.bench_function("generate_captures", |b| {
+        b.iter(|| {
+            // black_box prevents the compiler from optimizing the code away
+            perft2(black_box(&mut board), 5)
         })
     });
 }

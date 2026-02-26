@@ -347,6 +347,171 @@ fn get_rook_attacks(sq: u8, occ: u64) -> u64 {
     attacks
 }
 
+// --- HIGH SPEED CAPTURE GENERATOR FOR QUIESCENCE SEARCH ---
+
+pub fn generate_captures(board: &Board, moves: &mut [Move]) -> usize {
+    let mut curr_move_index = 0;
+
+    generate_pawn_captures(board, moves, &mut curr_move_index);
+    generate_knight_captures(board, moves, &mut curr_move_index);
+    generate_bishop_captures(board, moves, &mut curr_move_index);
+    generate_rook_captures(board, moves, &mut curr_move_index);
+    generate_queen_captures(board, moves, &mut curr_move_index);
+    generate_king_captures(board, moves, &mut curr_move_index);
+
+    curr_move_index
+}
+
+fn generate_pawn_captures(board: &Board, moves: &mut [Move], curr_move_index: &mut usize) {
+    let us = if board.white_to_move { Piece::WHITE } else { Piece::BLACK };
+    let mut pawns = board.pieces[Piece::new(us, Piece::PAWN).0 as usize];
+
+    while pawns != 0 {
+        let from = pawns.trailing_zeros() as u8;
+        pawns &= pawns - 1;
+
+        // 1. Pushes ONLY if they are Promotions
+        let to = if board.white_to_move { from + 8 } else { from - 8 };
+        if (board.pieces[0] & (1u64 << to)) == 0 {
+            if to >= 56 || to <= 7 {
+                push_promotions(moves, curr_move_index, from, to, false);
+            }
+            // Notice: Normal single push and double push are COMPLETELY DELETED!
+        }
+
+        // 2. Captures
+        let capture_offsets = if board.white_to_move { [7i8, 9i8] } else { [-7i8, -9i8] };
+        for &offset in &capture_offsets {
+            let target_sq = (from as i8 + offset) as u8;
+
+            let from_file = from & 7;
+            let target_file = target_sq & 7;
+            if (from_file as i8 - target_file as i8).abs() > 1 { continue; }
+            if target_sq > 63 { continue; }
+
+            let target_bit = 1u64 << target_sq;
+
+            if (target_bit & board.pieces[((us ^ 8) | Piece::ALL) as usize]) != 0 {
+                if target_sq >= 56 || target_sq <= 7 {
+                    push_promotions(moves, curr_move_index, from, target_sq, true);
+                } else {
+                    moves[*curr_move_index] = Move::new_with_flags(from, target_sq, Move::CAPTURE);
+                    *curr_move_index += 1;
+                }
+            }
+
+            if let Some(ep_sq) = board.en_passant_square {
+                if target_sq == ep_sq {
+                    moves[*curr_move_index] = Move::new_with_flags(from, target_sq, Move::EN_PASSANT);
+                    *curr_move_index += 1;
+                }
+            }
+        }
+    }
+}
+
+fn generate_knight_captures(board: &Board, moves: &mut [Move], curr_move_index: &mut usize) {
+    let us = if board.white_to_move { Piece::WHITE } else { Piece::BLACK };
+    let enemy_occ = board.pieces[((us ^ 8) | Piece::ALL) as usize];
+    let mut knights = board.pieces[(us | Piece::KNIGHT) as usize];
+
+    while knights != 0 {
+        let from = knights.trailing_zeros() as u8;
+
+        // MAGIC TRICK: We only intersect with enemy pieces. 
+        // This instantly deletes empty squares and friendly fire.
+        let mut attacks = KNIGHT_MOVES[from as usize] & enemy_occ;
+
+        while attacks != 0 {
+            let to = attacks.trailing_zeros() as u8;
+            moves[*curr_move_index] = Move::new_with_flags(from, to, Move::CAPTURE);
+            *curr_move_index += 1;
+            attacks &= attacks - 1;
+        }
+        knights &= knights - 1;
+    }
+}
+
+fn generate_king_captures(board: &Board, moves: &mut [Move], curr_move_index: &mut usize) {
+    let us = if board.white_to_move { Piece::WHITE } else { Piece::BLACK };
+    let enemy = us ^ 8;
+    let enemy_occ = board.pieces[(enemy | Piece::ALL) as usize];
+
+    let king_bb = board.pieces[(us | Piece::KING) as usize];
+    if king_bb == 0 { return; }
+    let from = king_bb.trailing_zeros() as u8;
+
+    // Same magic trick: only intersect with enemy pieces
+    let mut attacks = KING_MOVES[from as usize] & enemy_occ;
+
+    while attacks != 0 {
+        let to = attacks.trailing_zeros() as u8;
+        moves[*curr_move_index] = Move::new_with_flags(from, to, Move::CAPTURE);
+        *curr_move_index += 1;
+        attacks &= attacks - 1;
+    }
+    // Notice: Castling logic is COMPLETELY DELETED (you can't capture by castling)
+}
+
+fn generate_bishop_captures(board: &Board, moves: &mut [Move], curr_move_index: &mut usize) {
+    let us = if board.white_to_move { Piece::WHITE } else { Piece::BLACK };
+    let bishops = board.pieces[(us | Piece::BISHOP) as usize];
+    generate_sliding_captures(board, moves, curr_move_index, bishops, &BISHOP_SHIFTS);
+}
+
+fn generate_rook_captures(board: &Board, moves: &mut [Move], curr_move_index: &mut usize) {
+    let us = if board.white_to_move { Piece::WHITE } else { Piece::BLACK };
+    let rooks = board.pieces[(us | Piece::ROOK) as usize];
+    generate_sliding_captures(board, moves, curr_move_index, rooks, &ROOK_SHIFTS);
+}
+
+fn generate_queen_captures(board: &Board, moves: &mut [Move], curr_move_index: &mut usize) {
+    let us = if board.white_to_move { Piece::WHITE } else { Piece::BLACK };
+    let queens = board.pieces[(us | Piece::QUEEN) as usize];
+    generate_sliding_captures(board, moves, curr_move_index, queens, &BISHOP_SHIFTS);
+    generate_sliding_captures(board, moves, curr_move_index, queens, &ROOK_SHIFTS);
+}
+
+fn generate_sliding_captures(
+    board: &Board,
+    moves: &mut [Move],
+    curr_move_index: &mut usize,
+    mut piece_bb: u64,
+    shifts: &[(i8, u64)],
+) {
+    let us = if board.white_to_move { Piece::WHITE } else { Piece::BLACK };
+    let friendly_occ = board.pieces[(us | Piece::ALL) as usize];
+    let enemy_occ = board.pieces[((us ^ 8) | Piece::ALL) as usize];
+
+    while piece_bb != 0 {
+        let from = piece_bb.trailing_zeros() as u8;
+        let from_bit = 1u64 << from;
+
+        for &(shift, mask) in shifts {
+            let mut current_sq_mask = from_bit;
+            loop {
+                if shift > 0 {
+                    current_sq_mask = (current_sq_mask << shift) & mask;
+                } else {
+                    current_sq_mask = (current_sq_mask >> shift.abs()) & mask;
+                }
+
+                if current_sq_mask == 0 { break; } // Off board
+                if (current_sq_mask & friendly_occ) != 0 { break; } // Blocked by own piece
+
+                if (current_sq_mask & enemy_occ) != 0 {
+                    let to = current_sq_mask.trailing_zeros() as u8;
+                    moves[*curr_move_index] = Move::new_with_flags(from, to, Move::CAPTURE);
+                    *curr_move_index += 1;
+                    break; // Stop sliding after hitting enemy piece
+                }
+                // Notice: 'add quiet move' logic is COMPLETELY DELETED
+            }
+        }
+        piece_bb &= piece_bb - 1;
+    }
+}
+
 pub const KNIGHT_MOVES: [u64; 64] = {
     let mut table = [0u64; 64];
     let mut sq = 0;

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use crate::{Board, Move, generate_all_moves, is_square_attacked, Piece, ZobristKeys, OpeningBook, is_draw_by_repetition};
+use crate::{Board, Move, generate_all_moves, is_square_attacked, Piece, ZobristKeys, OpeningBook, is_draw_by_repetition, generate_captures};
 
 pub struct Engine {
     board: Board,
@@ -428,6 +428,9 @@ pub fn quiescence_search(
     abort: &Arc<AtomicBool>,
     nodes: &mut u64,
 ) -> f64 {
+    // return board.evaluate_board();
+
+
     // 1. Time management check
     *nodes += 1;
     if *nodes & 2047 == 0 && abort.load(Ordering::Relaxed) {
@@ -442,28 +445,21 @@ pub fn quiescence_search(
         alpha = stand_pat;
     }
 
-    let mut move_storage = [Move(0); 218];
-    let count = generate_all_moves(board, &mut move_storage);
+    let mut captures = [Move(0); 218];
+    let count = generate_captures(board, &mut captures);
 
     let us = if board.white_to_move { Piece::WHITE } else { Piece::BLACK };
     let enemy = us ^ 8;
 
-    let mut captures = [Move(0); 32];
     let mut scores = [0i32; 32];
-    let mut cap_count = 0;
 
     for i in 0..count {
-        let m = move_storage[i];
-        if m.is_capture() || m.is_promotion() {
-            captures[cap_count] = m;
-            scores[cap_count] = score_capture_qs(board, m);
-            cap_count += 1;
-        }
+        scores[i] = score_capture_qs(board, captures[i]);
     }
 
-    for i in 0..cap_count {
+    for i in 0..count {
         let mut best_idx = i;
-        for j in (i + 1)..cap_count {
+        for j in (i + 1)..count {
             if scores[j] > scores[best_idx] {
                 best_idx = j;
             }

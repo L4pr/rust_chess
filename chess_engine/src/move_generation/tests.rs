@@ -1,5 +1,5 @@
 // src/move_generation/tests.rs
-use crate::{Board, Move, generate_all_moves, is_square_attacked, Piece};
+use crate::{Board, Move, generate_all_moves, is_square_attacked, Piece, generate_captures};
 
 /// Perft (Performance Test) function to count all legal moves at a given depth
 /// Used for move generation testing and benchmarking
@@ -11,6 +11,34 @@ pub fn perft(board: &mut Board, depth: usize) -> u64 {
     let mut nodes = 0;
     let mut move_storage = [Move(0); 218];
     let count = generate_all_moves(board, &mut move_storage);
+
+    let us = if board.white_to_move { Piece::WHITE } else { Piece::BLACK };
+    let enemy = us ^ 8;
+
+    for i in 0..count {
+        let m = move_storage[i];
+        let mut new_board = *board; // Copy the board
+
+        new_board.make_move(m);    // Update the copy
+
+        let king_sq = new_board.pieces[(us | Piece::KING) as usize].trailing_zeros() as u8;
+
+        if !is_square_attacked(&new_board, king_sq, enemy) {
+            nodes += perft(&mut new_board, depth - 1);
+        }
+    }
+
+    nodes
+}
+
+pub fn perft2(board: &mut Board, depth: usize) -> u64 {
+    if depth == 0 {
+        return 1;
+    }
+
+    let mut nodes = 0;
+    let mut move_storage = [Move(0); 218];
+    let count = generate_captures(board, &mut move_storage);
 
     let us = if board.white_to_move { Piece::WHITE } else { Piece::BLACK };
     let enemy = us ^ 8;
