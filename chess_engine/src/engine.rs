@@ -434,8 +434,6 @@ pub fn quiescence_search(
         return 0.0;
     }
 
-    // 2. "Stand Pat" - We can always choose to NOT capture.
-    // If our current position is already too good for the opponent (>= beta), we cut off.
     let stand_pat = board.evaluate_board();
     if stand_pat >= beta {
         return beta;
@@ -444,55 +442,47 @@ pub fn quiescence_search(
         alpha = stand_pat;
     }
 
-    // 3. Generate moves
     let mut move_storage = [Move(0); 218];
     let count = generate_all_moves(board, &mut move_storage);
 
     let us = if board.white_to_move { Piece::WHITE } else { Piece::BLACK };
     let enemy = us ^ 8;
 
-    // Filter and score ONLY captures and promotions
-    let mut scores = [0i32; 218];
+    let mut captures = [Move(0); 32];
+    let mut scores = [0i32; 32];
+    let mut cap_count = 0;
+
     for i in 0..count {
         let m = move_storage[i];
         if m.is_capture() || m.is_promotion() {
-            scores[i] = score_capture_qs(board, m);
-        } else {
-            scores[i] = -10000; // Ignore quiet moves completely
+            captures[cap_count] = m;
+            scores[cap_count] = score_capture_qs(board, m);
+            cap_count += 1;
         }
     }
 
-    // 4. Test captures
-    for i in 0..count {
-        // Find best remaining capture
+    for i in 0..cap_count {
         let mut best_idx = i;
-        for j in (i + 1)..count {
+        for j in (i + 1)..cap_count {
             if scores[j] > scores[best_idx] {
                 best_idx = j;
             }
         }
-
-        // If the best move is a quiet move (-10000), we have run out of captures.
-        if scores[best_idx] == -10000 {
-            break;
-        }
-
-        move_storage.swap(i, best_idx);
+        captures.swap(i, best_idx);
         scores.swap(i, best_idx);
 
-        let m = move_storage[i];
+        let m = captures[i];
+
         let mut new_board = *board;
         new_board.make_move(m);
 
-        // Legality Check (Did our capture leave us in check?)
         let king_bit = new_board.pieces[(us | Piece::KING) as usize];
-        if king_bit == 0 { continue; } // King captured (pseudo-legal edge case)
+        if king_bit == 0 { continue; }
         let king_sq = king_bit.trailing_zeros() as u8;
         if is_square_attacked(&new_board, king_sq, enemy) {
             continue;
         }
 
-        // Recursively call Quiescence Search (No depth parameter!)
         let score = -quiescence_search(&new_board, -beta, -alpha, abort, nodes);
 
         if abort.load(Ordering::Relaxed) {
@@ -500,10 +490,10 @@ pub fn quiescence_search(
         }
 
         if score >= beta {
-            return beta; // Fail high
+            return beta;
         }
         if score > alpha {
-            alpha = score; // Update best score
+            alpha = score;
         }
     }
 
