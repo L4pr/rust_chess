@@ -2,15 +2,12 @@ use crate::{Move, Piece, CastlingRights, generate_all_moves, is_square_attacked,
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Board {
-    // 16 bitboards: 6 for each piece type (white and black) + 2 for all pieces of each color
-    // we have extra bitboards for all pieces of each color to speed up move generation and checks, those are saved right after the piece type bitboards (WHITE_ALL = 7, BLACK_ALL = 15)
-    // we also added an all pieces board, this is saved at index 0 and is used for move generation and checks, it is the bitwise OR of all piece type bitboards (WHITE_ALL | BLACK_ALL)
     pub pieces: [u64; 16],
     pub white_to_move: bool,
     pub en_passant_square: Option<u8>,
     pub castling_rights: CastlingRights,
+    pub halfmove_clock: u32,
 }
-
 
 impl Board {
     pub fn starting_position() -> Self {
@@ -23,10 +20,11 @@ impl Board {
             white_to_move: true,
             en_passant_square: None,
             castling_rights: CastlingRights::new(0),
+            halfmove_clock: 0,
         };
 
         let parts: Vec<&str> = fen.split_whitespace().collect();
-        if parts.len() != 6 {
+        if parts.len() < 4 {
             panic!("Invalid FEN string!");
         }
 
@@ -59,8 +57,7 @@ impl Board {
             }
         }
 
-        board.pieces[0] = board.pieces[7] | board.pieces[15]; // Update the all pieces bitboard
-
+        board.pieces[0] = board.pieces[7] | board.pieces[15];
         board.white_to_move = parts[1] == "w";
 
         let mut cr_val = 0;
@@ -81,6 +78,10 @@ impl Board {
             let file = chars.next().unwrap() as u8 - b'a';
             let rank = chars.next().unwrap() as u8 - b'1';
             board.en_passant_square = Some(rank * 8 + file);
+        }
+
+        if parts.len() > 4 {
+            board.halfmove_clock = parts[4].parse().unwrap_or(0);
         }
 
         board
@@ -163,23 +164,18 @@ impl Board {
             fen.push('-');
         }
 
-        fen.push_str(" 0 1");
+        fen.push_str(&format!(" {} 1", self.halfmove_clock));
 
         fen
     }
 
     pub fn to_book_fen(&self) -> String {
         let full_fen = self.get_fen();
-
-        // Split the FEN into its individual parts
         let parts: Vec<&str> = full_fen.split_whitespace().collect();
 
-        // Safety check to ensure the FEN is valid before we access indices
         if parts.len() >= 3 {
-            // Rebuild the string using the first 3 parts, and force En Passant to "-"
             format!("{} {} {} -", parts[0], parts[1], parts[2])
         } else {
-            // Fallback just in case get_fen() returns something weird
             full_fen
         }
     }
@@ -207,9 +203,8 @@ impl Board {
         let move_mask = from_bit | to_bit;
 
         let us = if self.white_to_move { Piece::WHITE } else { Piece::BLACK };
-        let them = us ^ 8; // Bitwise flip to get opponent's color (WHITE=0, BLACK=8)
+        let them = us ^ 8;
 
-        // 1. Identify the piece type being moved
         let mut moved_piece_type = Piece::PAWN;
         for pt in [Piece::PAWN, Piece::KNIGHT, Piece::BISHOP, Piece::ROOK, Piece::QUEEN, Piece::KING] {
             if (self.pieces[(us | pt) as usize] & from_bit) != 0 {
@@ -218,22 +213,25 @@ impl Board {
             }
         }
 
-        // 2. Handle Captures (except En Passant which is special)
+        if m.is_capture() || moved_piece_type == Piece::PAWN {
+            self.halfmove_clock = 0;
+        } else {
+            self.halfmove_clock += 1;
+        }
+
         if m.is_capture() && flags != Move::EN_PASSANT {
             for pt in [Piece::PAWN, Piece::KNIGHT, Piece::BISHOP, Piece::ROOK, Piece::QUEEN, Piece::KING] {
                 if (self.pieces[(them | pt) as usize] & to_bit) != 0 {
-                    self.pieces[(them | pt) as usize] ^= to_bit; // Remove captured piece
-                    self.pieces[(them | Piece::ALL) as usize] ^= to_bit; // Remove from "All" board
+                    self.pieces[(them | pt) as usize] ^= to_bit;
+                    self.pieces[(them | Piece::ALL) as usize] ^= to_bit;
                     break;
                 }
             }
         }
 
-        // 3. Move the piece
         self.pieces[(us | moved_piece_type) as usize] ^= move_mask;
         self.pieces[(us | Piece::ALL) as usize] ^= move_mask;
 
-        // 4. Special Case: En Passant Capture
         if flags == Move::EN_PASSANT {
             let capture_sq = if self.white_to_move { to - 8 } else { to + 8 };
             let cap_bit = 1u64 << capture_sq;
@@ -241,11 +239,8 @@ impl Board {
             self.pieces[(them | Piece::ALL) as usize] ^= cap_bit;
         }
 
-        // 5. Special Case: Promotions
         if m.is_promotion() {
-            // Remove the pawn that we just moved to the 'to' square
             self.pieces[(us | Piece::PAWN) as usize] ^= to_bit;
-            // TODO: This can maybe done faster vvv
             let promo_type = match flags {
                 Move::PR_KNIGHT | Move::PC_KNIGHT => Piece::KNIGHT,
                 Move::PR_BISHOP | Move::PC_BISHOP => Piece::BISHOP,
@@ -255,7 +250,6 @@ impl Board {
             self.pieces[(us | promo_type) as usize] ^= to_bit;
         }
 
-        // 6. Special Case: Castling
         if flags == Move::KING_CASTLE {
             let (r_from, r_to) = if self.white_to_move { (7, 5) } else { (63, 61) };
             let r_mask = (1u64 << r_from) | (1u64 << r_to);
@@ -268,26 +262,18 @@ impl Board {
             self.pieces[(us | Piece::ALL) as usize] ^= r_mask;
         }
 
-        // 7. Update State: En Passant Square
         self.en_passant_square = if flags == Move::DOUBLE_PAWN_PUSH {
             Some(if self.white_to_move { from + 8 } else { from - 8 })
         } else {
             None
         };
 
-        // 8. Update State: Castling Rights (If King or Rook moves/captured)
         self.update_castling_rights(from, to);
-
-        // 9. Update State: Turn and Global Occupancy
         self.white_to_move = !self.white_to_move;
-        self.pieces[0] = self.pieces[7] | self.pieces[15]; // Refresh total occupancy
+        self.pieces[0] = self.pieces[7] | self.pieces[15];
     }
 
     pub fn update_castling_rights(&mut self, from: u8, to: u8) {
-        // We use the table to update rights based on BOTH squares.
-        // If a piece moves FROM a corner, rights are lost.
-        // If a piece is captured ON a corner, rights are lost.
-        // If the King moves, both rights for that side are lost.
         self.castling_rights.0 &= CASTLING_MASKS[from as usize];
         self.castling_rights.0 &= CASTLING_MASKS[to as usize];
     }
@@ -303,17 +289,27 @@ impl Board {
     pub fn evaluate_board(&self) -> f64 {
         evaluate(self)
     }
-
-
 }
 
 const CASTLING_MASKS: [u8; 64] = [
-    0b1101, 0b1111, 0b1111, 0b1111, 0b1100, 0b1111, 0b1111, 0b1110, // Rank 1
+    0b1101, 0b1111, 0b1111, 0b1111, 0b1100, 0b1111, 0b1111, 0b1110,
     0b1111, 0b1111, 0b1111, 0b1111, 0b1111, 0b1111, 0b1111, 0b1111,
     0b1111, 0b1111, 0b1111, 0b1111, 0b1111, 0b1111, 0b1111, 0b1111,
     0b1111, 0b1111, 0b1111, 0b1111, 0b1111, 0b1111, 0b1111, 0b1111,
     0b1111, 0b1111, 0b1111, 0b1111, 0b1111, 0b1111, 0b1111, 0b1111,
     0b1111, 0b1111, 0b1111, 0b1111, 0b1111, 0b1111, 0b1111, 0b1111,
     0b1111, 0b1111, 0b1111, 0b1111, 0b1111, 0b1111, 0b1111, 0b1111,
-    0b0111, 0b1111, 0b1111, 0b1111, 0b0011, 0b1111, 0b1111, 0b1011, // Rank 8
+    0b0111, 0b1111, 0b1111, 0b1111, 0b0011, 0b1111, 0b1111, 0b1011,
 ];
+
+pub fn is_draw_by_repetition(halfmove_clock: u32, history: &[u64], current_hash: u64) -> bool {
+    // Only look back as far as the halfmove clock
+    let start = history.len().saturating_sub(halfmove_clock as usize);
+
+    for &h in history[start..].iter().rev() {
+        if h == current_hash {
+            return true;
+        }
+    }
+    false
+}

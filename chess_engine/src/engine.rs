@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use crate::{Board, Move, generate_all_moves, is_square_attacked, Piece, ZobristKeys, OpeningBook};
+use crate::{Board, Move, generate_all_moves, is_square_attacked, Piece, ZobristKeys, OpeningBook, is_draw_by_repetition};
 
 pub struct Engine {
     board: Board,
@@ -16,13 +16,13 @@ impl Engine {
         Engine {
             board: Board::starting_position(),
             zobrist: ZobristKeys::new(),
-            tt: TranspositionTable::new(64), // 64 MB transposition table
+            tt: TranspositionTable::new(64),
             book,
         }
     }
 
     pub fn clear_tt(&mut self) {
-        self.tt = TranspositionTable::new(64); // Clear the TT by creating a new one
+        self.tt = TranspositionTable::new(64);
     }
 
     pub fn set_board(&mut self, new_board: Board) {
@@ -53,7 +53,6 @@ impl Engine {
             let mut test_board = self.board;
             test_board.make_move(m);
 
-            // Legality Check
             let king_bit = test_board.pieces[(us | Piece::KING) as usize];
             if king_bit != 0 {
                 let king_sq = king_bit.trailing_zeros() as u8;
@@ -64,22 +63,17 @@ impl Engine {
         }
 
         let mut nodes = 0;
-
         let mut absolute_best_move = root_moves[0].m;
         let mut absolute_best_score = f64::NEG_INFINITY;
-
         let mut depth_searched = 0;
 
-        for depth in 1..25 { // Iterative Deepening
+        let mut history_stack: Vec<u64> = Vec::with_capacity(1024);
 
-            // 2. SORT THE ENTIRE ARRAY based on the previous depth's scores!
-            // This puts the best move 1st, second best 2nd, etc.
+        for depth in 1..25 {
             root_moves.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
 
             let mut alpha = f64::NEG_INFINITY;
             let beta = f64::INFINITY;
-
-            // We need to track if we should break completely out of the depth
             let mut search_aborted = false;
 
             let mut current_depth_best_move = root_moves[0].m;
@@ -88,25 +82,21 @@ impl Engine {
             for i in 0..root_moves.len() {
                 let m = root_moves[i].m;
                 let mut new_board = self.board;
+
+                let current_hash = self.zobrist.hash(&self.board);
+
                 new_board.make_move(m);
+                history_stack.push(current_hash);
 
-                // --- Legality Check ---
-                let us = if self.board.white_to_move { Piece::WHITE } else { Piece::BLACK };
-                let enemy = us ^ 8;
-                let king_bit = new_board.pieces[(us | Piece::KING) as usize];
-                if king_bit == 0 { continue; }
-                let king_sq = king_bit.trailing_zeros() as u8;
-                if is_square_attacked(&new_board, king_sq, enemy) { continue; }
+                let score = -alpha_beta(&new_board, -beta, -alpha, depth - 1, 1, &abort, &mut nodes, &mut self.tt, &self.zobrist, &mut history_stack);
 
-                // 3. Search the move (Now passing TT and Zobrist!)
-                let score = -alpha_beta(&new_board, -beta, -alpha, depth - 1, 1, &abort, &mut nodes, &mut self.tt, &self.zobrist);
+                history_stack.pop();
 
                 if abort.load(Ordering::Relaxed) {
                     search_aborted = true;
                     break;
                 }
 
-                // 4. Update the exact score for THIS specific move so we can sort it next depth
                 root_moves[i].score = score;
 
                 if score > current_depth_best_score {
@@ -120,24 +110,14 @@ impl Engine {
             }
 
             if search_aborted {
-                // If this partial depth just found a move that is STRICTLY BETTER
-                // than the best score from the last fully completed depth, it's safe to harvest it!
                 if current_depth_best_score > absolute_best_score {
                     absolute_best_move = current_depth_best_move;
                 }
-
                 break;
             }
 
-            // Because we sorted the array at the start, and updated scores,
-            // the best move of this depth will be sorted to index 0 on the next loop!
-            // We can just print the best one we found so far:
-
-            // (We have to re-find the max here just for the print, because the scores
-            // just updated and aren't sorted again until the next depth starts)
             absolute_best_move = current_depth_best_move;
             absolute_best_score = current_depth_best_score;
-
             depth_searched = depth;
 
             if absolute_best_score > 9000.0 {
@@ -167,15 +147,15 @@ impl Engine {
 pub fn alpha_beta(
     board: &Board,
     mut alpha: f64,
-    mut beta: f64, // Needs to be mut now so we can update it from the TT
+    mut beta: f64,
     depth: u32,
     ply: u32,
     abort: &Arc<AtomicBool>,
     nodes: &mut u64,
     tt: &mut TranspositionTable,
     zobrist: &ZobristKeys,
+    history: &mut Vec<u64>,
 ) -> f64 {
-    // 1. Check for abort every few nodes
     *nodes += 1;
     if *nodes & 2047 == 0 && abort.load(Ordering::Relaxed) {
         return 0.0;
@@ -186,10 +166,13 @@ pub fn alpha_beta(
         return board.evaluate_board();
     }
 
-    // --- TT PROBE START ---
-    let original_alpha = alpha;
     let hash_key = zobrist.hash(board);
 
+    if ply > 0 && (board.halfmove_clock >= 100 || is_draw_by_repetition(board.halfmove_clock, history, hash_key)) {
+        return 0.0;
+    }
+
+    let original_alpha = alpha;
     let mut tt_move = None;
 
     if let Some(entry) = tt.probe(hash_key) {
@@ -213,14 +196,12 @@ pub fn alpha_beta(
             }
         }
     }
-    // --- TT PROBE END ---
 
-    // 2. Base Case: Leaf Node
     if depth == 0 {
-        return board.evaluate_board();
+        // return board.evaluate_board();
+        return quiescence_search(board, alpha, beta, abort, nodes);
     }
 
-    // 3. Generate and Sort Moves
     let mut move_storage = [Move(0); 218];
     let count = generate_all_moves(board, &mut move_storage);
 
@@ -250,7 +231,6 @@ pub fn alpha_beta(
         let mut new_board = *board;
         new_board.make_move(m);
 
-        // Check legality (Did we leave our king in check?)
         let king_bit = new_board.pieces[(us | Piece::KING) as usize];
         let king_sq = king_bit.trailing_zeros() as u8;
         if is_square_attacked(&new_board, king_sq, enemy) {
@@ -266,14 +246,14 @@ pub fn alpha_beta(
             let enemy_king_sq = enemy_king_bit.trailing_zeros() as u8;
             if is_square_attacked(&new_board, enemy_king_sq, us) {
                 extension = 1;
-            } else if m.is_capture() {
-                // extension = 1;
             }
         }
 
-        // Recursively call with -beta and -alpha (Negamax style)
-        // This flips the perspective for the other player
-        let score = -alpha_beta(&new_board, -beta, -alpha, depth - 1 + extension, ply + 1, abort, nodes, tt, zobrist);
+        history.push(hash_key);
+
+        let score = -alpha_beta(&new_board, -beta, -alpha, depth - 1 + extension, ply + 1, abort, nodes, tt, zobrist, history);
+
+        history.pop();
 
         if abort.load(Ordering::Relaxed) {
             return 0.0;
@@ -285,7 +265,6 @@ pub fn alpha_beta(
         }
 
         if score >= beta {
-            // STORE BEFORE RETURNING!
             let mut store_score = best_score;
             if store_score > 9000.0 {
                 store_score += ply as f64;
@@ -296,18 +275,17 @@ pub fn alpha_beta(
             return best_score;
         }
         if score > alpha {
-            alpha = score; // This is our new best move
+            alpha = score;
         }
     }
 
-    // 4. Checkmate/Stalemate Detection
     if legal_moves == 0 {
         let king_bit = board.pieces[(us | Piece::KING) as usize];
         let king_sq = king_bit.trailing_zeros() as u8;
         best_score = if is_square_attacked(board, king_sq, enemy) {
-            -10000.0 + (ply as f64) // Checkmate (prefer faster mates)
+            -10000.0 + (ply as f64)
         } else {
-            0.0 // Stalemate
+            0.0
         };
 
         let mut store_score = best_score;
@@ -321,7 +299,6 @@ pub fn alpha_beta(
         return best_score;
     }
 
-    // --- TT STORE START ---
     let tt_flag = if best_score <= original_alpha {
         TTFlag::UpperBound
     } else {
@@ -329,31 +306,25 @@ pub fn alpha_beta(
     };
 
     tt.store(hash_key, depth, best_score, tt_flag, best_move);
-    // --- TT STORE END ---
 
     alpha
 }
 
 fn score_move(m: Move, _board: &Board, tt_move: Option<Move>) -> i32 {
-    // 1. Highest Priority: The move from the Transposition Table
     if Some(m) == tt_move {
         return 10_000;
     }
 
     let mut score = 0;
 
-    // 2. High Priority: Captures
-    // (Later you can upgrade this to MVV-LVA: Most Valuable Victim, Least Valuable Attacker) TODO
     if m.is_capture() {
         score += 1_000;
     }
 
-    // 3. Medium Priority: Promotions
     if m.is_promotion() {
         score += 900;
     }
 
-    // Quiet moves get a score of 0
     score
 }
 
@@ -366,16 +337,16 @@ struct RootMove {
 #[derive(Clone, Copy, PartialEq)]
 pub enum TTFlag {
     Exact,
-    LowerBound, // We got a Beta cutoff (score >= beta)
-    UpperBound, // We failed low (score <= alpha)
+    LowerBound,
+    UpperBound,
 }
 
 #[derive(Clone, Copy)]
 pub struct TTEntry {
-    pub key: u64,          // Zobrist hash of the position
-    pub score: f64,        // Evaluation
-    pub depth: u32,        // How deep we searched to get this score
-    pub flag: TTFlag,      // Exact, Alpha, or Beta
+    pub key: u64,
+    pub score: f64,
+    pub depth: u32,
+    pub flag: TTFlag,
     pub best_move: Option<Move>,
 }
 
@@ -386,11 +357,8 @@ pub struct TranspositionTable {
 
 impl TranspositionTable {
     pub fn new(size_mb: usize) -> Self {
-        // Calculate how many entries fit in the given Megabytes
-        let entry_size = size_of::<TTEntry>();
+        let entry_size = std::mem::size_of::<TTEntry>();
         let num_entries = (size_mb * 1024 * 1024) / entry_size;
-
-        // Find the next power of 2 for fast bitwise indexing
         let capacity = num_entries.next_power_of_two();
 
         Self {
@@ -419,10 +387,125 @@ impl TranspositionTable {
         let index = (key as usize) & self.mask;
         let current_entry = self.entries[index];
 
-        // Replacement Strategy: Replace if it's a completely different board (collision)
-        // OR if the new search looked just as deep or deeper than the old one. TODO: look at this
         if current_entry.key != key || depth >= current_entry.depth {
             self.entries[index] = TTEntry { key, score, depth, flag, best_move };
         }
     }
+}
+
+fn score_capture_qs(board: &Board, m: Move) -> i32 {
+    let to_bit = 1u64 << m.to_sq();
+    let from_bit = 1u64 << m.from_sq();
+
+    let us = if board.white_to_move { Piece::WHITE } else { Piece::BLACK };
+    let them = us ^ 8;
+
+    // 1. Find Victim Value (Unrolled for speed)
+    let victim_val = if m.flags() == Move::EN_PASSANT { 100 }
+    else if (board.pieces[(them | Piece::QUEEN) as usize] & to_bit) != 0 { 900 }
+    else if (board.pieces[(them | Piece::ROOK) as usize] & to_bit) != 0 { 500 }
+    else if (board.pieces[(them | Piece::BISHOP) as usize] & to_bit) != 0 { 330 }
+    else if (board.pieces[(them | Piece::KNIGHT) as usize] & to_bit) != 0 { 320 }
+    else { 100 }; // Defaults to Pawn
+
+    // 2. Find Attacker Value (Unrolled for speed)
+    let attacker_val = if (board.pieces[(us | Piece::PAWN) as usize] & from_bit) != 0 { 100 }
+    else if (board.pieces[(us | Piece::KNIGHT) as usize] & from_bit) != 0 { 320 }
+    else if (board.pieces[(us | Piece::BISHOP) as usize] & from_bit) != 0 { 330 }
+    else if (board.pieces[(us | Piece::ROOK) as usize] & from_bit) != 0 { 500 }
+    else if (board.pieces[(us | Piece::QUEEN) as usize] & from_bit) != 0 { 900 }
+    else { 20000 }; // King
+
+    let promo_bonus = if m.is_promotion() { 900 } else { 0 };
+
+    (victim_val * 10) - attacker_val + promo_bonus
+}
+
+pub fn quiescence_search(
+    board: &Board,
+    mut alpha: f64,
+    beta: f64,
+    abort: &Arc<AtomicBool>,
+    nodes: &mut u64,
+) -> f64 {
+    // 1. Time management check
+    *nodes += 1;
+    if *nodes & 2047 == 0 && abort.load(Ordering::Relaxed) {
+        return 0.0;
+    }
+
+    // 2. "Stand Pat" - We can always choose to NOT capture.
+    // If our current position is already too good for the opponent (>= beta), we cut off.
+    let stand_pat = board.evaluate_board();
+    if stand_pat >= beta {
+        return beta;
+    }
+    if alpha < stand_pat {
+        alpha = stand_pat;
+    }
+
+    // 3. Generate moves
+    let mut move_storage = [Move(0); 218];
+    let count = generate_all_moves(board, &mut move_storage);
+
+    let us = if board.white_to_move { Piece::WHITE } else { Piece::BLACK };
+    let enemy = us ^ 8;
+
+    // Filter and score ONLY captures and promotions
+    let mut scores = [0i32; 218];
+    for i in 0..count {
+        let m = move_storage[i];
+        if m.is_capture() || m.is_promotion() {
+            scores[i] = score_capture_qs(board, m);
+        } else {
+            scores[i] = -10000; // Ignore quiet moves completely
+        }
+    }
+
+    // 4. Test captures
+    for i in 0..count {
+        // Find best remaining capture
+        let mut best_idx = i;
+        for j in (i + 1)..count {
+            if scores[j] > scores[best_idx] {
+                best_idx = j;
+            }
+        }
+
+        // If the best move is a quiet move (-10000), we have run out of captures.
+        if scores[best_idx] == -10000 {
+            break;
+        }
+
+        move_storage.swap(i, best_idx);
+        scores.swap(i, best_idx);
+
+        let m = move_storage[i];
+        let mut new_board = *board;
+        new_board.make_move(m);
+
+        // Legality Check (Did our capture leave us in check?)
+        let king_bit = new_board.pieces[(us | Piece::KING) as usize];
+        if king_bit == 0 { continue; } // King captured (pseudo-legal edge case)
+        let king_sq = king_bit.trailing_zeros() as u8;
+        if is_square_attacked(&new_board, king_sq, enemy) {
+            continue;
+        }
+
+        // Recursively call Quiescence Search (No depth parameter!)
+        let score = -quiescence_search(&new_board, -beta, -alpha, abort, nodes);
+
+        if abort.load(Ordering::Relaxed) {
+            return 0.0;
+        }
+
+        if score >= beta {
+            return beta; // Fail high
+        }
+        if score > alpha {
+            alpha = score; // Update best score
+        }
+    }
+
+    alpha
 }

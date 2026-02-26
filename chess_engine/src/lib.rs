@@ -14,3 +14,4 @@ pub use move_generation::tests::perft;
 pub use board::zobrist::ZobristKeys;
 pub use move_generation::book::OpeningBook;
 pub use board::evaluation::evaluate;
+pub use board::board::is_draw_by_repetition;

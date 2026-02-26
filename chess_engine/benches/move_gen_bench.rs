@@ -31,9 +31,10 @@ fn bench_alpha_beta(crit: &mut Criterion) {
                 // Create a fresh 2MB TT and reset the node counter so it doesn't just read the cache.
                 let tt = TranspositionTable::new(2);
                 let nodes = 0u64;
-                (tt, nodes)
+                let history_stack: Vec<u64> = Vec::with_capacity(1024);
+                (tt, nodes, history_stack)
             },
-            |(mut tt, mut nodes)| {
+            |(mut tt, mut nodes, mut history_stack)| {
                 // BENCHMARK PHASE: This is the actual code being timed!
                 alpha_beta(
                     black_box(&board),
@@ -45,6 +46,7 @@ fn bench_alpha_beta(crit: &mut Criterion) {
                     &mut nodes,
                     &mut tt,
                     &zobrist,
+                    &mut history_stack,
                 );
 
                 // Return nodes so the compiler doesn't optimize the function call away entirely
