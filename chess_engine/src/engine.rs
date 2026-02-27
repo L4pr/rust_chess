@@ -48,6 +48,10 @@ impl Engine {
 
         let mut root_moves = Vec::new();
 
+        if count == 0 {
+            return None;
+        }
+
         for i in 0..count {
             let m = move_storage[i];
             let mut test_board = self.board;
@@ -83,12 +87,22 @@ impl Engine {
                 let m = root_moves[i].m;
                 let mut new_board = self.board;
 
+                let mut extension = 0;
+
+                let enemy_king_bit = new_board.pieces[(enemy | Piece::KING) as usize];
+                if enemy_king_bit != 0 {
+                    let enemy_king_sq = enemy_king_bit.trailing_zeros() as u8;
+                    if is_square_attacked(&new_board, enemy_king_sq, us) {
+                        extension = 1;
+                    }
+                }
+
                 let current_hash = self.zobrist.hash(&self.board);
 
                 new_board.make_move(m);
                 history_stack.push(current_hash);
 
-                let score = -alpha_beta(&new_board, -beta, -alpha, depth - 1, 1, &abort, &mut nodes, &mut self.tt, &self.zobrist, &mut history_stack);
+                let score = -alpha_beta(&new_board, -beta, -alpha, depth - 1 + extension, 1, &abort, &mut nodes, &mut self.tt, &self.zobrist, &mut history_stack);
 
                 history_stack.pop();
 
@@ -196,6 +210,8 @@ pub fn alpha_beta(
             }
         }
     }
+
+    let depth = if depth == 0 && board.is_in_check() { 1 } else { depth };
 
     if depth == 0 {
         // return board.evaluate_board();
@@ -307,7 +323,7 @@ pub fn alpha_beta(
 
     tt.store(hash_key, depth, best_score, tt_flag, best_move);
 
-    alpha
+    best_score
 }
 
 fn score_move(m: Move, _board: &Board, tt_move: Option<Move>) -> i32 {
@@ -439,7 +455,7 @@ pub fn quiescence_search(
 
     let stand_pat = board.evaluate_board();
     if stand_pat >= beta {
-        return beta;
+        return stand_pat;
     }
     if alpha < stand_pat {
         alpha = stand_pat;
