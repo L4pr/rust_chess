@@ -17,69 +17,113 @@ pub fn generate_all_moves(board: &Board, moves: &mut [Move]) -> usize {
 
 fn generate_pawn_moves(board: &Board, moves: &mut [Move], curr_move_index: &mut usize) {
     let us = if board.white_to_move { Piece::WHITE } else { Piece::BLACK };
-    let mut pawns = board.pieces[Piece::new(us, Piece::PAWN).0 as usize];
-    while pawns != 0 {
-        let from = pawns.trailing_zeros() as u8;
-        pawns &= pawns - 1; // Clear the bit for the current pawn
+    let pawns = board.pieces[Piece::new(us, Piece::PAWN).0 as usize];
+    let empty = !board.pieces[0];
+    let enemy_occ = board.pieces[((us ^ 8) | Piece::ALL) as usize];
 
-        // Single Push
-        let to = if board.white_to_move { from + 8 } else { from - 8 };
+    let rank_4 = if board.white_to_move { 0x00000000FF000000u64 } else { 0x000000FF00000000u64 };
+    let promo_rank = if board.white_to_move { 0xFF00000000000000u64 } else { 0x00000000000000FFu64 };
 
-        if (board.pieces[0] & (1u64 << to)) == 0 {
-            if to >= 56 || to <= 7 {
-                push_promotions(moves, curr_move_index, from, to, false);
-            } else {
-                moves[*curr_move_index] = Move::new_with_flags(from, to, Move::QUIET);
-                *curr_move_index += 1;
+    // --- Single pushes ---
+    let single = if board.white_to_move { pawns << 8 } else { pawns >> 8 } & empty;
 
-                // DOUBLE PUSH
-                // Only check if single push was successful and we are on the starting rank
-                let start_rank = if board.white_to_move { from / 8 == 1 } else { from / 8 == 6 };
-                if start_rank {
-                    let double_to = if board.white_to_move { from + 16 } else { from - 16 };
-                    if (board.pieces[0] & (1u64 << double_to)) == 0 {
-                        moves[*curr_move_index] = Move::new_with_flags(from, double_to, Move::DOUBLE_PAWN_PUSH);
-                        *curr_move_index += 1;
-                    }
-                }
-            }
+    // Promotions
+    let mut promos = single & promo_rank;
+    while promos != 0 {
+        let to = promos.trailing_zeros() as u8;
+        let from = if board.white_to_move { to - 8 } else { to + 8 };
+        push_promotions(moves, curr_move_index, from, to, false);
+        promos &= promos - 1;
+    }
+
+    // Quiet single pushes (non-promotion)
+    let mut quiet = single & !promo_rank;
+    while quiet != 0 {
+        let to = quiet.trailing_zeros() as u8;
+        let from = if board.white_to_move { to - 8 } else { to + 8 };
+        moves[*curr_move_index] = Move::new_with_flags(from, to, Move::QUIET);
+        *curr_move_index += 1;
+        quiet &= quiet - 1;
+    }
+
+    // --- Double pushes ---
+    let double = if board.white_to_move {
+        (single << 8) & empty & rank_4
+    } else {
+        (single >> 8) & empty & rank_4
+    };
+    let mut dbl = double;
+    while dbl != 0 {
+        let to = dbl.trailing_zeros() as u8;
+        let from = if board.white_to_move { to - 16 } else { to + 16 };
+        moves[*curr_move_index] = Move::new_with_flags(from, to, Move::DOUBLE_PAWN_PUSH);
+        *curr_move_index += 1;
+        dbl &= dbl - 1;
+    }
+
+    // --- Captures ---
+    let (left_shift, right_shift): (fn(u64) -> u64, fn(u64) -> u64) = if board.white_to_move {
+        (|b| (b << 7) & NOT_H_FILE, |b| (b << 9) & NOT_A_FILE)
+    } else {
+        (|b| (b >> 9) & NOT_H_FILE, |b| (b >> 7) & NOT_A_FILE)
+    };
+
+    // Left captures
+    let mut left_caps = left_shift(pawns) & enemy_occ;
+    let mut left_promos = left_caps & promo_rank;
+    left_caps &= !promo_rank;
+
+    while left_promos != 0 {
+        let to = left_promos.trailing_zeros() as u8;
+        let from = if board.white_to_move { to - 7 } else { to + 9 };
+        push_promotions(moves, curr_move_index, from, to, true);
+        left_promos &= left_promos - 1;
+    }
+    while left_caps != 0 {
+        let to = left_caps.trailing_zeros() as u8;
+        let from = if board.white_to_move { to - 7 } else { to + 9 };
+        moves[*curr_move_index] = Move::new_with_flags(from, to, Move::CAPTURE);
+        *curr_move_index += 1;
+        left_caps &= left_caps - 1;
+    }
+
+    // Right captures
+    let mut right_caps = right_shift(pawns) & enemy_occ;
+    let mut right_promos = right_caps & promo_rank;
+    right_caps &= !promo_rank;
+
+    while right_promos != 0 {
+        let to = right_promos.trailing_zeros() as u8;
+        let from = if board.white_to_move { to - 9 } else { to + 7 };
+        push_promotions(moves, curr_move_index, from, to, true);
+        right_promos &= right_promos - 1;
+    }
+    while right_caps != 0 {
+        let to = right_caps.trailing_zeros() as u8;
+        let from = if board.white_to_move { to - 9 } else { to + 7 };
+        moves[*curr_move_index] = Move::new_with_flags(from, to, Move::CAPTURE);
+        *curr_move_index += 1;
+        right_caps &= right_caps - 1;
+    }
+
+    // --- En passant ---
+    if let Some(ep_sq) = board.en_passant_square {
+        let ep_bit = 1u64 << ep_sq;
+        let left_ep = left_shift(pawns) & ep_bit;
+        if left_ep != 0 {
+            let from = if board.white_to_move { ep_sq - 7 } else { ep_sq + 9 };
+            moves[*curr_move_index] = Move::new_with_flags(from, ep_sq, Move::EN_PASSANT);
+            *curr_move_index += 1;
         }
-
-        // Captures
-        let capture_offsets = if board.white_to_move { [7i8, 9i8] } else { [-7i8, -9i8] };
-
-        for &offset in &capture_offsets {
-            let target_sq = (from as i8 + offset) as u8;
-
-            // Prevent wrapping (e.g., a-file pawn capturing left to h-file)
-            let from_file = from & 7;
-            let target_file = target_sq & 7;
-            if (from_file as i8 - target_file as i8).abs() > 1 { continue; }
-            if target_sq > 63 { continue; } // Safety check for board boundaries
-
-            let target_bit = 1u64 << target_sq;
-
-            // Standard Captures
-            if (target_bit & board.pieces[((us ^ 8) | Piece::ALL) as usize]) != 0 {
-                if target_sq >= 56 || target_sq <= 7 {
-                    push_promotions(moves, curr_move_index, from, target_sq, true);
-                } else {
-                    moves[*curr_move_index] = Move::new_with_flags(from, target_sq, Move::CAPTURE);
-                    *curr_move_index += 1;
-                }
-            }
-
-            // EN PASSANT
-            if let Some(ep_sq) = board.en_passant_square {
-                if target_sq == ep_sq {
-                    moves[*curr_move_index] = Move::new_with_flags(from, target_sq, Move::EN_PASSANT);
-                    *curr_move_index += 1;
-                }
-            }
+        let right_ep = right_shift(pawns) & ep_bit;
+        if right_ep != 0 {
+            let from = if board.white_to_move { ep_sq - 9 } else { ep_sq + 7 };
+            moves[*curr_move_index] = Move::new_with_flags(from, ep_sq, Move::EN_PASSANT);
+            *curr_move_index += 1;
         }
-
     }
 }
+
 
 fn push_promotions(moves: &mut [Move], index: &mut usize, from: u8, to: u8, capture: bool) {
     let flags = if capture {
@@ -378,48 +422,80 @@ pub fn generate_captures(board: &Board, moves: &mut [Move]) -> usize {
 
 fn generate_pawn_captures(board: &Board, moves: &mut [Move], curr_move_index: &mut usize) {
     let us = if board.white_to_move { Piece::WHITE } else { Piece::BLACK };
-    let mut pawns = board.pieces[Piece::new(us, Piece::PAWN).0 as usize];
+    let pawns = board.pieces[Piece::new(us, Piece::PAWN).0 as usize];
+    let empty = !board.pieces[0];
+    let enemy_occ = board.pieces[((us ^ 8) | Piece::ALL) as usize];
+    let promo_rank = if board.white_to_move { 0xFF00000000000000u64 } else { 0x00000000000000FFu64 };
 
-    while pawns != 0 {
-        let from = pawns.trailing_zeros() as u8;
-        pawns &= pawns - 1;
+    // Promotion pushes (capture-only gen still includes these since they're tactical)
+    let single = if board.white_to_move { pawns << 8 } else { pawns >> 8 } & empty;
+    let mut promos = single & promo_rank;
+    while promos != 0 {
+        let to = promos.trailing_zeros() as u8;
+        let from = if board.white_to_move { to - 8 } else { to + 8 };
+        push_promotions(moves, curr_move_index, from, to, false);
+        promos &= promos - 1;
+    }
 
-        // 1. Pushes ONLY if they are Promotions
-        let to = if board.white_to_move { from + 8 } else { from - 8 };
-        if (board.pieces[0] & (1u64 << to)) == 0 {
-            if to >= 56 || to <= 7 {
-                push_promotions(moves, curr_move_index, from, to, false);
-            }
-            // Notice: Normal single push and double push are COMPLETELY DELETED!
+    // Captures
+    let (left_shift, right_shift): (fn(u64) -> u64, fn(u64) -> u64) = if board.white_to_move {
+        (|b| (b << 7) & NOT_H_FILE, |b| (b << 9) & NOT_A_FILE)
+    } else {
+        (|b| (b >> 9) & NOT_H_FILE, |b| (b >> 7) & NOT_A_FILE)
+    };
+
+    // Left captures
+    let mut left_caps = left_shift(pawns) & enemy_occ;
+    let mut left_promos = left_caps & promo_rank;
+    left_caps &= !promo_rank;
+
+    while left_promos != 0 {
+        let to = left_promos.trailing_zeros() as u8;
+        let from = if board.white_to_move { to - 7 } else { to + 9 };
+        push_promotions(moves, curr_move_index, from, to, true);
+        left_promos &= left_promos - 1;
+    }
+    while left_caps != 0 {
+        let to = left_caps.trailing_zeros() as u8;
+        let from = if board.white_to_move { to - 7 } else { to + 9 };
+        moves[*curr_move_index] = Move::new_with_flags(from, to, Move::CAPTURE);
+        *curr_move_index += 1;
+        left_caps &= left_caps - 1;
+    }
+
+    // Right captures
+    let mut right_caps = right_shift(pawns) & enemy_occ;
+    let mut right_promos = right_caps & promo_rank;
+    right_caps &= !promo_rank;
+
+    while right_promos != 0 {
+        let to = right_promos.trailing_zeros() as u8;
+        let from = if board.white_to_move { to - 9 } else { to + 7 };
+        push_promotions(moves, curr_move_index, from, to, true);
+        right_promos &= right_promos - 1;
+    }
+    while right_caps != 0 {
+        let to = right_caps.trailing_zeros() as u8;
+        let from = if board.white_to_move { to - 9 } else { to + 7 };
+        moves[*curr_move_index] = Move::new_with_flags(from, to, Move::CAPTURE);
+        *curr_move_index += 1;
+        right_caps &= right_caps - 1;
+    }
+
+    // En passant
+    if let Some(ep_sq) = board.en_passant_square {
+        let ep_bit = 1u64 << ep_sq;
+        let left_ep = left_shift(pawns) & ep_bit;
+        if left_ep != 0 {
+            let from = if board.white_to_move { ep_sq - 7 } else { ep_sq + 9 };
+            moves[*curr_move_index] = Move::new_with_flags(from, ep_sq, Move::EN_PASSANT);
+            *curr_move_index += 1;
         }
-
-        // 2. Captures
-        let capture_offsets = if board.white_to_move { [7i8, 9i8] } else { [-7i8, -9i8] };
-        for &offset in &capture_offsets {
-            let target_sq = (from as i8 + offset) as u8;
-
-            let from_file = from & 7;
-            let target_file = target_sq & 7;
-            if (from_file as i8 - target_file as i8).abs() > 1 { continue; }
-            if target_sq > 63 { continue; }
-
-            let target_bit = 1u64 << target_sq;
-
-            if (target_bit & board.pieces[((us ^ 8) | Piece::ALL) as usize]) != 0 {
-                if target_sq >= 56 || target_sq <= 7 {
-                    push_promotions(moves, curr_move_index, from, target_sq, true);
-                } else {
-                    moves[*curr_move_index] = Move::new_with_flags(from, target_sq, Move::CAPTURE);
-                    *curr_move_index += 1;
-                }
-            }
-
-            if let Some(ep_sq) = board.en_passant_square {
-                if target_sq == ep_sq {
-                    moves[*curr_move_index] = Move::new_with_flags(from, target_sq, Move::EN_PASSANT);
-                    *curr_move_index += 1;
-                }
-            }
+        let right_ep = right_shift(pawns) & ep_bit;
+        if right_ep != 0 {
+            let from = if board.white_to_move { ep_sq - 9 } else { ep_sq + 7 };
+            moves[*curr_move_index] = Move::new_with_flags(from, ep_sq, Move::EN_PASSANT);
+            *curr_move_index += 1;
         }
     }
 }
