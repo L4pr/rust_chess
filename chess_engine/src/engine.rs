@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use crate::{Board, Move, generate_all_moves, is_square_attacked, Piece, OpeningBook, is_draw_by_repetition, generate_captures};
+use crate::{Board, Move, generate_all_moves, is_square_attacked, Piece, OpeningBook, is_draw_by_repetition, generate_captures, is_legal_and_gives_check, count_occurrences_in_history};
 use crate::board::zobrist::zobrist;
 
 // ==========================================
@@ -149,7 +149,7 @@ fn gives_check(board: &Board, us: u8, enemy: u8) -> bool {
 #[inline]
 fn check_time_abort(ss: &mut SearchState, abort: &Arc<AtomicBool>) -> bool {
     ss.nodes += 1;
-    (ss.nodes & 2047 == 0) && abort.load(Ordering::Relaxed)
+    (ss.nodes & 4095 == 0) && abort.load(Ordering::Relaxed)
 }
 
 #[inline]
@@ -264,6 +264,7 @@ impl Engine {
     /// if the prediction is correct, the next real search starts warm.
     pub fn ponder(&mut self, board: Board, abort: Arc<AtomicBool>) {
         self.board = board;
+        self.tt.new_generation();
 
         let mut move_storage = [Move::new(0, 0); MAX_MOVES];
         let count = generate_all_moves(&self.board, &mut move_storage);
@@ -337,6 +338,7 @@ impl Engine {
         let mut move_storage = [Move::new(0, 0); MAX_MOVES];
         let count = generate_all_moves(&self.board, &mut move_storage);
 
+        self.tt.new_generation();
         let (us, enemy) = get_colors(&self.board);
         let mut root_moves = Vec::with_capacity(count);
 
@@ -390,7 +392,7 @@ impl Engine {
 
                     history_stack.push(current_hash);
 
-                    let score;
+                    let mut score;
                     if move_idx == 0 {
                         // First move: full window search
                         score = -alpha_beta(&new_board, -beta, -alpha, depth - 1 + extension, 1, child_in_check, &abort, &mut ss, &mut self.tt, &mut history_stack);
@@ -409,6 +411,28 @@ impl Engine {
                     if abort.load(Ordering::Relaxed) {
                         search_aborted = true;
                         break;
+                    }
+
+                    // ---- Root repetition penalty ----
+                    // If this move leads to a position already in the game history,
+                    // it risks a draw by repetition. Penalize heavily to force the
+                    // engine to find non-repeating lines, even if they look slightly worse.
+                    let reps = count_occurrences_in_history(&self.game_history, new_board.zobrist_hash);
+                    if reps >= 2 {
+                        // Position already occurred twice — playing it = 3-fold draw claim.
+                        // This is a guaranteed draw, score it as such.
+                        score = 0;
+                    } else if reps == 1 {
+                        // Position seen once before — playing it gives opponent the option
+                        // to force a draw on the next repetition. Heavily penalize.
+                        if score > 0 {
+                            // We think we're winning, but repeating risks throwing that away.
+                            // Apply a penalty proportional to our advantage: the more we're
+                            // winning, the worse it is to risk a draw.
+                            score = -(score / 4).max(50);
+                        }
+                        // If we're already losing, repeating might actually be good
+                        // (opponent won't claim the draw), so don't penalize.
                     }
 
                     root_move.score = score;
@@ -536,9 +560,10 @@ fn alpha_beta(
     // ---- Razoring ----
     // If static eval is far below alpha at low depth, a full search is unlikely
     // to raise it. Drop directly into qsearch to save time.
+    // NEVER razor when mate scores involved — qsearch can't detect stalemate.
     if !is_pv && !in_check && depth <= 3
         && static_eval + 300 * (depth as i32) <= alpha
-        && alpha.abs() < MATE_BOUND
+        && alpha.abs() < MATE_BOUND && beta.abs() < MATE_BOUND
     {
         let razor_score = quiescence_search(board, alpha, beta, 0, false, abort, ss, tt);
         if razor_score <= alpha { return razor_score; }
@@ -551,14 +576,15 @@ fn alpha_beta(
     let rfp_margin = RFP_MARGIN * (depth as i32) - if improving { 60 } else { 0 };
     if !is_pv && !in_check && depth <= 7
         && static_eval - rfp_margin >= beta
-        && beta.abs() < MATE_BOUND
+        && alpha.abs() < MATE_BOUND && beta.abs() < MATE_BOUND
     {
         return static_eval;
     }
 
     // --- Null Move Pruning ---
     if !is_pv && depth >= 3 && !in_check && board.has_non_pawn_material()
-        && static_eval >= beta && beta.abs() < MATE_BOUND
+        && static_eval >= beta
+        && alpha.abs() < MATE_BOUND && beta.abs() < MATE_BOUND
     {
         let mut null_board = *board;
         let z = zobrist();
@@ -610,7 +636,7 @@ fn alpha_beta(
     let mut best_move = None;
     let futility_pruning = !is_pv && !in_check && depth <= 3
         && static_eval + FUTILITY_MARGIN * (depth as i32) <= alpha
-        && alpha.abs() < MATE_BOUND;
+        && alpha.abs() < MATE_BOUND && beta.abs() < MATE_BOUND;
 
     // Track quiet moves searched so we can penalize them on cutoffs
     let mut quiets_searched = [Move(0); MAX_MOVES];
@@ -623,11 +649,11 @@ fn alpha_beta(
         let mut new_board = *board;
         new_board.make_move(m);
 
-        if !is_move_legal(&new_board, us, enemy) { continue; }
+        let (legal, child_in_check) = is_legal_and_gives_check(&new_board, us, enemy);
+        if !legal { continue; }
 
         legal_moves += 1;
         let is_quiet = !m.is_capture() && !m.is_promotion();
-        let child_in_check = gives_check(&new_board, us, enemy);
         let extension = if child_in_check { 1 } else { 0 };
 
         // ---- Futility Pruning ----
@@ -639,8 +665,10 @@ fn alpha_beta(
 
         // ---- Late Move Pruning ----
         // At very low depths, after trying enough moves, stop generating quiet moves
+        // NEVER prune when mate scores are involved at any level
         if !is_pv && depth <= 3 && is_quiet && !in_check
-            && best_score.abs() < MATE_BOUND
+            && best_score > -MATE_BOUND && best_score.abs() < MATE_BOUND
+            && alpha.abs() < MATE_BOUND && beta.abs() < MATE_BOUND
             && legal_moves > (3 + 4 * depth as usize) {
             continue;
         }
@@ -740,28 +768,34 @@ struct RootMove { m: Move, score: i32 }
 #[derive(Clone, Copy, PartialEq)]
 pub enum TTFlag { Exact, LowerBound, UpperBound }
 
-/// Packed TT entry: 12 bytes (down from ~24)
-/// key32 (4) + score (4) + best_move (2) + depth (1) + flag (1) = 12
+/// Packed TT entry: 12 bytes
+/// key32 (4) + score (4) + best_move (2) + depth (1) + flag_gen (1) = 12
+/// flag_gen packs: 2 bits flag (0-2) + 6 bits generation (0-63)
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct TTEntry {
-    key32: u32,        // upper 32 bits of zobrist key for verification
+    key32: u32,
     score: i32,
-    best_move: u16,    // raw Move bits (0 = no move)
+    best_move: u16,
     depth: u8,
-    flag: u8,          // 0=Exact, 1=LowerBound, 2=UpperBound
+    flag_gen: u8,      // bits 0-1: flag, bits 2-7: generation
 }
 
 impl TTEntry {
-    const EMPTY: Self = TTEntry { key32: 0, score: 0, best_move: 0, depth: 0, flag: 0 };
+    const EMPTY: Self = TTEntry { key32: 0, score: 0, best_move: 0, depth: 0, flag_gen: 0 };
 
     #[inline]
     fn get_flag(&self) -> TTFlag {
-        match self.flag {
+        match self.flag_gen & 3 {
             1 => TTFlag::LowerBound,
             2 => TTFlag::UpperBound,
             _ => TTFlag::Exact,
         }
+    }
+
+    #[inline]
+    fn get_generation(&self) -> u8 {
+        self.flag_gen >> 2
     }
 
     #[inline]
@@ -773,6 +807,7 @@ impl TTEntry {
 pub struct TranspositionTable {
     entries: Vec<TTEntry>,
     mask: usize,
+    generation: u8, // 6 bits used (0-63), wraps around
 }
 
 impl TranspositionTable {
@@ -784,7 +819,16 @@ impl TranspositionTable {
         Self {
             entries: vec![TTEntry::EMPTY; capacity],
             mask: capacity - 1,
+            generation: 0,
         }
+    }
+
+    /// Increment generation counter — called at the start of each search.
+    /// Old entries from previous searches will be considered "stale" and
+    /// more easily replaced, improving TT hit rates in real games.
+    #[inline]
+    pub fn new_generation(&mut self) {
+        self.generation = (self.generation + 1) & 63; // wrap at 6 bits
     }
 
     #[inline]
@@ -803,15 +847,27 @@ impl TranspositionTable {
         let index = (key as usize) & self.mask;
         let current = self.entries[index];
         let key32 = (key >> 32) as u32;
+        let flag_gen = (self.generation << 2) | match flag {
+            TTFlag::Exact => 0,
+            TTFlag::LowerBound => 1,
+            TTFlag::UpperBound => 2,
+        };
 
-        // Replace if: different position, or new search is at least as deep
-        if current.key32 != key32 || depth as u8 >= current.depth {
+        // Replace if:
+        // 1. Empty slot or different position
+        // 2. Same position with deeper or equal depth
+        // 3. Entry is from a stale generation (old search)
+        let should_replace = current.key32 != key32
+            || depth as u8 >= current.depth
+            || current.get_generation() != self.generation;
+
+        if should_replace {
             self.entries[index] = TTEntry {
                 key32,
                 score,
                 best_move: best_move.map_or(0, |m| m.0),
                 depth: depth as u8,
-                flag: match flag { TTFlag::Exact => 0, TTFlag::LowerBound => 1, TTFlag::UpperBound => 2 },
+                flag_gen,
             };
         }
     }
@@ -854,10 +910,11 @@ fn quiescence_search(board: &Board, mut alpha: i32, beta: i32, ply: u32, in_chec
 
             let mut new_board = *board;
             new_board.make_move(m);
-            if !is_move_legal(&new_board, us, enemy) { continue; }
+
+            let (legal, child_in_check) = is_legal_and_gives_check(&new_board, us, enemy);
+            if !legal { continue; }
 
             legal_moves += 1;
-            let child_in_check = gives_check(&new_board, us, enemy);
             let score = -quiescence_search(&new_board, -beta, -alpha, ply + 1, child_in_check, abort, ss, tt);
 
             if abort.load(Ordering::Relaxed) { return 0; }
@@ -913,9 +970,9 @@ fn quiescence_search(board: &Board, mut alpha: i32, beta: i32, ply: u32, in_chec
         let mut new_board = *board;
         new_board.make_move(m);
 
-        if !is_move_legal(&new_board, us, enemy) { continue; }
+        let (legal, child_in_check) = is_legal_and_gives_check(&new_board, us, enemy);
+        if !legal { continue; }
 
-        let child_in_check = gives_check(&new_board, us, enemy);
         let score = -quiescence_search(&new_board, -beta, -alpha, ply + 1, child_in_check, abort, ss, tt);
 
         if abort.load(Ordering::Relaxed) { return 0; }

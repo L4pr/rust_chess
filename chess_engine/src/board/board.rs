@@ -379,19 +379,31 @@ const CASTLING_MASKS: [u8; 64] = [
 ];
 
 pub fn is_draw_by_repetition(halfmove_clock: u32, history: &[u64], current_hash: u64) -> bool {
-    // Positions can only repeat with the same side to move, so step by 2
     let len = history.len();
     let lookback = (halfmove_clock as usize).min(len);
-    if lookback < 2 { return false; }
+    if lookback < 1 { return false; }
 
-    let mut i = len - 2;
-    let stop = len - lookback;
-    loop {
+    // Check all positions within the lookback window.
+    // We check every entry (not step-by-2) because game history and search
+    // pushes can have mixed parity, and a cheap u64 comparison is negligible.
+    let start = len - lookback;
+    for i in start..len {
         if history[i] == current_hash {
             return true;
         }
-        if i < stop + 2 { break; }
-        i -= 2;
     }
     false
 }
+
+/// Count how many times `hash` appears in the game history.
+/// Used at the root to detect positions that have occurred before —
+/// if a move leads to a position already seen twice, it's a 3-fold draw.
+/// If seen once, it would be a 2-fold and the engine should strongly avoid it.
+pub fn count_occurrences_in_history(history: &[u64], hash: u64) -> u32 {
+    let mut count = 0u32;
+    for &h in history {
+        if h == hash { count += 1; }
+    }
+    count
+}
+

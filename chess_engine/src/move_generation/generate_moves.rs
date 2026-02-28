@@ -354,8 +354,6 @@ fn generate_king_moves(board: &Board, moves: &mut [Move], curr_move_index: &mut 
 #[inline]
 pub fn is_square_attacked(board: &Board, sq: u8, attacker_color: u8) -> bool {
     // 1. KNIGHT Attacks
-    // Reciprocal logic: If a Knight on 'sq' can hit an enemy Knight,
-    // then that enemy Knight is attacking 'sq'.
     let enemy_knights = board.pieces[(attacker_color | Piece::KNIGHT) as usize];
     if (KNIGHT_MOVES[sq as usize] & enemy_knights) != 0 { return true; }
 
@@ -366,31 +364,103 @@ pub fn is_square_attacked(board: &Board, sq: u8, attacker_color: u8) -> bool {
     // 3. PAWN Attacks
     let enemy_pawns = board.pieces[(attacker_color | Piece::PAWN) as usize];
     let sq_bit = 1u64 << sq;
-    // We look "backwards" from the square to see if a pawn could be there.
-    // If we are checking if WHITE is attacking, we look where BLACK pawns would come from.
     let pawn_attacks = if attacker_color == Piece::WHITE {
-        // White pawns attack "up" (from lower ranks to higher)
         ((sq_bit >> 7) & NOT_A_FILE) | ((sq_bit >> 9) & NOT_H_FILE)
     } else {
-        // Black pawns attack "down"
         ((sq_bit << 7) & NOT_H_FILE) | ((sq_bit << 9) & NOT_A_FILE)
     };
     if (pawn_attacks & enemy_pawns) != 0 { return true; }
 
     // 4. SLIDING Attacks (Bishops, Rooks, Queens)
-    let occupancy = board.pieces[0]; // All pieces on board block rays
+    let occupancy = board.pieces[0];
 
-    // --- Bishop/Queen Attacks (Diagonals) ---
     let enemy_diag = board.pieces[(attacker_color | Piece::BISHOP) as usize] |
         board.pieces[(attacker_color | Piece::QUEEN) as usize];
     if (get_bishop_attacks(sq, occupancy) & enemy_diag) != 0 { return true; }
 
-    // --- Rook/Queen Attacks (Orthogonals) ---
     let enemy_ortho = board.pieces[(attacker_color | Piece::ROOK) as usize] |
         board.pieces[(attacker_color | Piece::QUEEN) as usize];
     if (get_rook_attacks(sq, occupancy) & enemy_ortho) != 0 { return true; }
 
     false
+}
+
+/// Combined legality check + gives-check detection.
+/// Returns (is_legal, gives_check) in a single pass, avoiding two separate
+/// is_square_attacked calls which would redundantly recompute magic bitboard lookups.
+/// The `us` color is the side that just MOVED (the parent's side to move).
+#[inline]
+pub fn is_legal_and_gives_check(board: &Board, us: u8, enemy: u8) -> (bool, bool) {
+    let occupancy = board.pieces[0];
+
+    // --- Check legality: our king must not be attacked by enemy ---
+    let our_king = board.pieces[(us | Piece::KING) as usize];
+    if our_king == 0 { return (false, false); }
+    let our_king_sq = our_king.trailing_zeros() as u8;
+
+    // Check enemy attacks on our king (cheapest checks first)
+    // Knights
+    if KNIGHT_MOVES[our_king_sq as usize] & board.pieces[(enemy | Piece::KNIGHT) as usize] != 0 {
+        return (false, false);
+    }
+    // Pawns
+    let king_bit = 1u64 << our_king_sq;
+    let pawn_attacks = if enemy == Piece::WHITE {
+        ((king_bit >> 7) & NOT_A_FILE) | ((king_bit >> 9) & NOT_H_FILE)
+    } else {
+        ((king_bit << 7) & NOT_H_FILE) | ((king_bit << 9) & NOT_A_FILE)
+    };
+    if pawn_attacks & board.pieces[(enemy | Piece::PAWN) as usize] != 0 {
+        return (false, false);
+    }
+    // King (for adjacent king detection)
+    if KING_MOVES[our_king_sq as usize] & board.pieces[(enemy | Piece::KING) as usize] != 0 {
+        return (false, false);
+    }
+    // Sliders — reuse occupancy
+    let enemy_diag = board.pieces[(enemy | Piece::BISHOP) as usize] |
+        board.pieces[(enemy | Piece::QUEEN) as usize];
+    if get_bishop_attacks(our_king_sq, occupancy) & enemy_diag != 0 {
+        return (false, false);
+    }
+    let enemy_ortho = board.pieces[(enemy | Piece::ROOK) as usize] |
+        board.pieces[(enemy | Piece::QUEEN) as usize];
+    if get_rook_attacks(our_king_sq, occupancy) & enemy_ortho != 0 {
+        return (false, false);
+    }
+
+    // --- Legal! Now check if enemy king is in check (attacked by us) ---
+    let enemy_king = board.pieces[(enemy | Piece::KING) as usize];
+    if enemy_king == 0 { return (true, false); }
+    let enemy_king_sq = enemy_king.trailing_zeros() as u8;
+
+    // Knights
+    if KNIGHT_MOVES[enemy_king_sq as usize] & board.pieces[(us | Piece::KNIGHT) as usize] != 0 {
+        return (true, true);
+    }
+    // Pawns
+    let eking_bit = 1u64 << enemy_king_sq;
+    let our_pawn_attacks = if us == Piece::WHITE {
+        ((eking_bit >> 7) & NOT_A_FILE) | ((eking_bit >> 9) & NOT_H_FILE)
+    } else {
+        ((eking_bit << 7) & NOT_H_FILE) | ((eking_bit << 9) & NOT_A_FILE)
+    };
+    if our_pawn_attacks & board.pieces[(us | Piece::PAWN) as usize] != 0 {
+        return (true, true);
+    }
+    // Sliders — reuse same occupancy (already computed above)
+    let our_diag = board.pieces[(us | Piece::BISHOP) as usize] |
+        board.pieces[(us | Piece::QUEEN) as usize];
+    if get_bishop_attacks(enemy_king_sq, occupancy) & our_diag != 0 {
+        return (true, true);
+    }
+    let our_ortho = board.pieces[(us | Piece::ROOK) as usize] |
+        board.pieces[(us | Piece::QUEEN) as usize];
+    if get_rook_attacks(enemy_king_sq, occupancy) & our_ortho != 0 {
+        return (true, true);
+    }
+
+    (true, false)
 }
 
 // Note: get_bishop_attacks and get_rook_attacks are now imported from magic_bitboards module
