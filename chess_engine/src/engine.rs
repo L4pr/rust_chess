@@ -110,9 +110,7 @@ impl SearchState {
 
     #[inline]
     fn update_history(&mut self, board: &Board, m: Move, bonus: i32) {
-        let us = if board.white_to_move { Piece::WHITE } else { Piece::BLACK };
-        let from_bit = 1u64 << m.from_sq();
-        let piece_idx = find_piece_index(board, us, from_bit) as usize;
+        let piece_idx = board.mailbox[m.from_sq() as usize] as usize;
         let h = &mut self.history[piece_idx][m.to_sq() as usize];
         // Gravity formula: prevents unbounded growth
         *h += bonus - (*h * bonus.abs() / 16384);
@@ -120,21 +118,9 @@ impl SearchState {
 
     #[inline]
     fn get_history(&self, board: &Board, m: Move) -> i32 {
-        let us = if board.white_to_move { Piece::WHITE } else { Piece::BLACK };
-        let from_bit = 1u64 << m.from_sq();
-        let piece_idx = find_piece_index(board, us, from_bit) as usize;
+        let piece_idx = board.mailbox[m.from_sq() as usize] as usize;
         self.history[piece_idx][m.to_sq() as usize]
     }
-}
-
-#[inline]
-fn find_piece_index(board: &Board, us: u8, from_bit: u64) -> u8 {
-    for pt in [Piece::PAWN, Piece::KNIGHT, Piece::BISHOP, Piece::ROOK, Piece::QUEEN, Piece::KING] {
-        if board.pieces[(us | pt) as usize] & from_bit != 0 {
-            return us | pt;
-        }
-    }
-    0
 }
 
 // ==========================================
@@ -206,25 +192,26 @@ fn pick_next_best_move(moves: &mut [Move], scores: &mut [i32], start_idx: usize,
 // MVV-LVA: Most Valuable Victim – Least Valuable Attacker
 #[inline]
 fn mvv_lva(board: &Board, m: Move) -> i32 {
-    let to_bit = 1u64 << m.to_sq();
-    let from_bit = 1u64 << m.from_sq();
-    let (us, them) = get_colors(board);
-
-    let victim = if m.flags() == Move::EN_PASSANT { 100 }
-    else if (board.pieces[(them | Piece::QUEEN) as usize] & to_bit) != 0 { 900 }
-    else if (board.pieces[(them | Piece::ROOK) as usize] & to_bit) != 0 { 500 }
-    else if (board.pieces[(them | Piece::BISHOP) as usize] & to_bit) != 0 { 330 }
-    else if (board.pieces[(them | Piece::KNIGHT) as usize] & to_bit) != 0 { 320 }
-    else { 100 }; // pawn
-
-    let attacker = if (board.pieces[(us | Piece::PAWN) as usize] & from_bit) != 0 { 100 }
-    else if (board.pieces[(us | Piece::KNIGHT) as usize] & from_bit) != 0 { 320 }
-    else if (board.pieces[(us | Piece::BISHOP) as usize] & from_bit) != 0 { 330 }
-    else if (board.pieces[(us | Piece::ROOK) as usize] & from_bit) != 0 { 500 }
-    else if (board.pieces[(us | Piece::QUEEN) as usize] & from_bit) != 0 { 900 }
-    else { 0 }; // king
-
+    let victim = if m.flags() == Move::EN_PASSANT {
+        100
+    } else {
+        piece_value(board.mailbox[m.to_sq() as usize] & 0x07)
+    };
+    let attacker = piece_value(board.mailbox[m.from_sq() as usize] & 0x07);
     victim * 10 - attacker
+}
+
+#[inline]
+fn piece_value(pt: u8) -> i32 {
+    match pt {
+        Piece::PAWN => 100,
+        Piece::KNIGHT => 320,
+        Piece::BISHOP => 330,
+        Piece::ROOK => 500,
+        Piece::QUEEN => 900,
+        Piece::KING => 0,
+        _ => 0,
+    }
 }
 
 // ==========================================

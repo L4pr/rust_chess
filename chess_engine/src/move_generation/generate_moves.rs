@@ -140,33 +140,22 @@ fn push_promotions(moves: &mut [Move], index: &mut usize, from: u8, to: u8, capt
 
 fn generate_knight_moves(board: &Board, moves: &mut [Move], curr_move_index: &mut usize) {
     let us = if board.white_to_move { Piece::WHITE } else { Piece::BLACK };
+    let friendly_occ = board.pieces[(us | Piece::ALL) as usize];
+    let enemy_occ = board.pieces[((us ^ 8) | Piece::ALL) as usize];
     let mut knights = board.pieces[(us | Piece::KNIGHT) as usize];
 
     while knights != 0 {
         let from = knights.trailing_zeros() as u8;
-
-        // 1. Get all potential moves for this square
-        // 2. Filter out squares occupied by our own pieces (& !friendly_occ)
-        let mut attacks = KNIGHT_MOVES[from as usize] & !board.pieces[(us | Piece::ALL) as usize];
+        let mut attacks = KNIGHT_MOVES[from as usize] & !friendly_occ;
 
         while attacks != 0 {
             let to = attacks.trailing_zeros() as u8;
-            let to_bit = 1u64 << to;
-
-            // Determine if it's a capture for the Move flag
-            let enemy_occ = board.pieces[((us ^ 8) | Piece::ALL) as usize];
-            let flag = if (to_bit & enemy_occ) != 0 {
-                Move::CAPTURE
-            } else {
-                Move::QUIET
-            };
-
+            let flag = if ((1u64 << to) & enemy_occ) != 0 { Move::CAPTURE } else { Move::QUIET };
             moves[*curr_move_index] = Move::new_with_flags(from, to, flag);
             *curr_move_index += 1;
-
-            attacks &= attacks - 1; // Clear processed bit
+            attacks &= attacks - 1;
         }
-        knights &= knights - 1; // Clear processed knight
+        knights &= knights - 1;
     }
 }
 
@@ -283,7 +272,7 @@ fn generate_king_moves(board: &Board, moves: &mut [Move], curr_move_index: &mut 
 
     // Get King's square index
     let king_bb = board.pieces[(us | Piece::KING) as usize];
-    if king_bb == 0 { return; } // Should never happen in a real game TODO: Handle this case more gracefully (e.g., return an error or panic)
+    if king_bb == 0 { return; }
     let from = king_bb.trailing_zeros() as u8;
 
     // --- 1. BASIC JUMPS ---
@@ -362,6 +351,7 @@ fn generate_king_moves(board: &Board, moves: &mut [Move], curr_move_index: &mut 
     }
 }
 
+#[inline]
 pub fn is_square_attacked(board: &Board, sq: u8, attacker_color: u8) -> bool {
     // 1. KNIGHT Attacks
     // Reciprocal logic: If a Knight on 'sq' can hit an enemy Knight,

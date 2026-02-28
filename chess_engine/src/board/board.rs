@@ -4,12 +4,16 @@ use crate::board::zobrist::{zobrist, ZobristKeys};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Board {
     pub pieces: [u64; 16],
+    /// Mailbox: for each square, stores the piece index (color|type), or EMPTY (0xFF)
+    pub mailbox: [u8; 64],
     pub white_to_move: bool,
     pub en_passant_square: Option<u8>,
     pub castling_rights: CastlingRights,
     pub halfmove_clock: u32,
     pub zobrist_hash: u64,
 }
+
+const EMPTY: u8 = 0xFF;
 
 impl Board {
     pub fn starting_position() -> Self {
@@ -19,6 +23,7 @@ impl Board {
     pub fn from_fen(fen: &str) -> Self {
         let mut board = Board {
             pieces: [0; 16],
+            mailbox: [EMPTY; 64],
             white_to_move: true,
             en_passant_square: None,
             castling_rights: CastlingRights::new(0),
@@ -55,6 +60,7 @@ impl Board {
                 let square = row * 8 + col;
                 board.pieces[Piece::new(color, piece_type).0 as usize] |= 1u64 << square;
                 board.pieces[(color | Piece::ALL) as usize] |= 1u64 << square;
+                board.mailbox[square] = color | piece_type;
 
                 col += 1;
             }
@@ -187,13 +193,38 @@ impl Board {
     }
 
     pub fn parse_uci_to_move(&self, uci: &str) -> Option<Move> {
+        let bytes = uci.as_bytes();
+        if bytes.len() < 4 { return None; }
+
+        let from_file = bytes[0] - b'a';
+        let from_rank = bytes[1] - b'1';
+        let to_file = bytes[2] - b'a';
+        let to_rank = bytes[3] - b'1';
+        let from_sq = from_rank * 8 + from_file;
+        let to_sq = to_rank * 8 + to_file;
+
+        let promo_char = if bytes.len() > 4 { Some(bytes[4]) } else { None };
+
         let mut move_storage = [Move(0); 218];
         let count = generate_all_moves(self, &mut move_storage);
-        let legal_moves = &move_storage[..count];
 
-        for &m in legal_moves {
-            if m.to_uci() == uci {
-                return Some(m);
+        for i in 0..count {
+            let m = move_storage[i];
+            if m.from_sq() == from_sq && m.to_sq() == to_sq {
+                // Check promotion match
+                if m.is_promotion() {
+                    let m_promo = match m.flags() {
+                        Move::PR_KNIGHT | Move::PC_KNIGHT => b'n',
+                        Move::PR_BISHOP | Move::PC_BISHOP => b'b',
+                        Move::PR_ROOK | Move::PC_ROOK => b'r',
+                        _ => b'q',
+                    };
+                    if promo_char == Some(m_promo) {
+                        return Some(m);
+                    }
+                } else if promo_char.is_none() {
+                    return Some(m);
+                }
             }
         }
 
@@ -219,13 +250,9 @@ impl Board {
             self.zobrist_hash ^= z.en_passant[(ep_sq % 8) as usize];
         }
 
-        let mut moved_piece_type = Piece::PAWN;
-        for pt in [Piece::PAWN, Piece::KNIGHT, Piece::BISHOP, Piece::ROOK, Piece::QUEEN, Piece::KING] {
-            if (self.pieces[(us | pt) as usize] & from_bit) != 0 {
-                moved_piece_type = pt;
-                break;
-            }
-        }
+        // O(1) piece lookup via mailbox
+        let moved_piece = self.mailbox[from as usize];
+        let moved_piece_type = moved_piece & 0x07; // mask out color bits
 
         if m.is_capture() || moved_piece_type == Piece::PAWN {
             self.halfmove_clock = 0;
@@ -233,24 +260,25 @@ impl Board {
             self.halfmove_clock += 1;
         }
 
-        // Remove captured piece
+        // Remove captured piece (O(1) via mailbox)
         if m.is_capture() && flags != Move::EN_PASSANT {
-            for pt in [Piece::PAWN, Piece::KNIGHT, Piece::BISHOP, Piece::ROOK, Piece::QUEEN, Piece::KING] {
-                if (self.pieces[(them | pt) as usize] & to_bit) != 0 {
-                    self.pieces[(them | pt) as usize] ^= to_bit;
-                    self.pieces[(them | Piece::ALL) as usize] ^= to_bit;
-                    self.zobrist_hash ^= z.pieces[ZobristKeys::piece_index(them, pt)][to as usize];
-                    break;
-                }
-            }
+            let captured = self.mailbox[to as usize];
+            debug_assert_ne!(captured, EMPTY);
+            let cap_type = captured & 0x07;
+            self.pieces[(them | cap_type) as usize] ^= to_bit;
+            self.pieces[(them | Piece::ALL) as usize] ^= to_bit;
+            self.zobrist_hash ^= z.pieces[ZobristKeys::piece_index(them, cap_type)][to as usize];
+            // mailbox[to] will be overwritten below
         }
 
-        // Move the piece (XOR out from old square, XOR in to new square)
+        // Move the piece
         let zi = ZobristKeys::piece_index(us, moved_piece_type);
         self.zobrist_hash ^= z.pieces[zi][from as usize];
         self.zobrist_hash ^= z.pieces[zi][to as usize];
         self.pieces[(us | moved_piece_type) as usize] ^= move_mask;
         self.pieces[(us | Piece::ALL) as usize] ^= move_mask;
+        self.mailbox[to as usize] = moved_piece;
+        self.mailbox[from as usize] = EMPTY;
 
         // En passant capture
         if flags == Move::EN_PASSANT {
@@ -259,6 +287,7 @@ impl Board {
             self.pieces[(them | Piece::PAWN) as usize] ^= cap_bit;
             self.pieces[(them | Piece::ALL) as usize] ^= cap_bit;
             self.zobrist_hash ^= z.pieces[ZobristKeys::piece_index(them, Piece::PAWN)][capture_sq as usize];
+            self.mailbox[capture_sq as usize] = EMPTY;
         }
 
         // Promotion: remove pawn, add promoted piece
@@ -274,25 +303,30 @@ impl Board {
             };
             self.pieces[(us | promo_type) as usize] ^= to_bit;
             self.zobrist_hash ^= z.pieces[ZobristKeys::piece_index(us, promo_type)][to as usize];
+            self.mailbox[to as usize] = us | promo_type;
         }
 
         // Castling rook movement
         if flags == Move::KING_CASTLE {
-            let (r_from, r_to) = if self.white_to_move { (7, 5) } else { (63, 61) };
+            let (r_from, r_to) = if self.white_to_move { (7u8, 5u8) } else { (63u8, 61u8) };
             let r_mask = (1u64 << r_from) | (1u64 << r_to);
             self.pieces[(us | Piece::ROOK) as usize] ^= r_mask;
             self.pieces[(us | Piece::ALL) as usize] ^= r_mask;
             let ri = ZobristKeys::piece_index(us, Piece::ROOK);
             self.zobrist_hash ^= z.pieces[ri][r_from as usize];
             self.zobrist_hash ^= z.pieces[ri][r_to as usize];
+            self.mailbox[r_to as usize] = us | Piece::ROOK;
+            self.mailbox[r_from as usize] = EMPTY;
         } else if flags == Move::QUEEN_CASTLE {
-            let (r_from, r_to) = if self.white_to_move { (0, 3) } else { (56, 59) };
+            let (r_from, r_to) = if self.white_to_move { (0u8, 3u8) } else { (56u8, 59u8) };
             let r_mask = (1u64 << r_from) | (1u64 << r_to);
             self.pieces[(us | Piece::ROOK) as usize] ^= r_mask;
             self.pieces[(us | Piece::ALL) as usize] ^= r_mask;
             let ri = ZobristKeys::piece_index(us, Piece::ROOK);
             self.zobrist_hash ^= z.pieces[ri][r_from as usize];
             self.zobrist_hash ^= z.pieces[ri][r_to as usize];
+            self.mailbox[r_to as usize] = us | Piece::ROOK;
+            self.mailbox[r_from as usize] = EMPTY;
         }
 
         // En passant square
@@ -356,13 +390,19 @@ const CASTLING_MASKS: [u8; 64] = [
 ];
 
 pub fn is_draw_by_repetition(halfmove_clock: u32, history: &[u64], current_hash: u64) -> bool {
-    // Only look back as far as the halfmove clock
-    let start = history.len().saturating_sub(halfmove_clock as usize);
+    // Positions can only repeat with the same side to move, so step by 2
+    let len = history.len();
+    let lookback = (halfmove_clock as usize).min(len);
+    if lookback < 2 { return false; }
 
-    for &h in history[start..].iter().rev() {
-        if h == current_hash {
+    let mut i = len - 2;
+    let stop = len - lookback;
+    loop {
+        if history[i] == current_hash {
             return true;
         }
+        if i < stop + 2 { break; }
+        i -= 2;
     }
     false
 }
