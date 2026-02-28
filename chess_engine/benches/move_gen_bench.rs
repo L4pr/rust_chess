@@ -52,8 +52,8 @@ fn bench_alpha_beta(crit: &mut Criterion) {
                 // BENCHMARK PHASE: This is the actual code being timed!
                 alpha_beta(
                     black_box(&board),
-                    f64::NEG_INFINITY,
-                    f64::INFINITY,
+                    i32::MIN + 1,
+                    i32::MAX - 1,
                     target_depth,
                     0,
                     &abort,

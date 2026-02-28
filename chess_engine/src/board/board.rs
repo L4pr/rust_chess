@@ -286,8 +286,18 @@ impl Board {
         is_square_attacked(self, king_sq, us ^ 8)
     }
 
-    pub fn evaluate_board(&self) -> f64 {
+    pub fn evaluate_board(&self) -> i32 {
         evaluate(self)
+    }
+
+    /// Returns true if the side to move has at least one non-pawn, non-king piece.
+    /// Used to avoid null-move pruning in endgames with only pawns.
+    pub fn has_non_pawn_material(&self) -> bool {
+        let us = if self.white_to_move { Piece::WHITE } else { Piece::BLACK };
+        (self.pieces[(us | Piece::KNIGHT) as usize]
+            | self.pieces[(us | Piece::BISHOP) as usize]
+            | self.pieces[(us | Piece::ROOK) as usize]
+            | self.pieces[(us | Piece::QUEEN) as usize]) != 0
     }
 }
 
