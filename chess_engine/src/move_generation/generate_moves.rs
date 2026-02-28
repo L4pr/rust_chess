@@ -1,6 +1,7 @@
 use crate::board::board::Board;
 use crate::board::move_struct::Move;
 use crate::board::pieces::*;
+use crate::move_generation::magic_bitboards::{get_rook_attacks, get_bishop_attacks, get_queen_attacks};
 pub fn generate_all_moves(board: &Board, moves: &mut [Move]) -> usize {
     let mut curr_move_index = 0;
 
@@ -127,63 +128,106 @@ fn generate_knight_moves(board: &Board, moves: &mut [Move], curr_move_index: &mu
 
 fn generate_bishop_moves(board: &Board, moves: &mut [Move], curr_move_index: &mut usize) {
     let us = if board.white_to_move { Piece::WHITE } else { Piece::BLACK };
-    let bishops = board.pieces[(us | Piece::BISHOP) as usize];
-    generate_sliding_moves(board, moves, curr_move_index, bishops, &BISHOP_SHIFTS);
+    let enemy = us ^ 8;
+    let mut bishops = board.pieces[(us | Piece::BISHOP) as usize];
+
+    let friendly_occ = board.pieces[(us | Piece::ALL) as usize];
+    let enemy_occ = board.pieces[(enemy | Piece::ALL) as usize];
+    let total_occ = board.pieces[0];
+
+    while bishops != 0 {
+        let from = bishops.trailing_zeros() as u8;
+
+        // Use magic bitboards to get all attacks
+        let mut attacks = get_bishop_attacks(from, total_occ) & !friendly_occ;
+
+        while attacks != 0 {
+            let to = attacks.trailing_zeros() as u8;
+            let to_bit = 1u64 << to;
+
+            let flag = if (to_bit & enemy_occ) != 0 {
+                Move::CAPTURE
+            } else {
+                Move::QUIET
+            };
+
+            moves[*curr_move_index] = Move::new_with_flags(from, to, flag);
+            *curr_move_index += 1;
+
+            attacks &= attacks - 1;
+        }
+
+        bishops &= bishops - 1;
+    }
 }
 
 fn generate_rook_moves(board: &Board, moves: &mut [Move], curr_move_index: &mut usize) {
     let us = if board.white_to_move { Piece::WHITE } else { Piece::BLACK };
-    let rooks = board.pieces[(us | Piece::ROOK) as usize];
-    generate_sliding_moves(board, moves, curr_move_index, rooks, &ROOK_SHIFTS);
+    let enemy = us ^ 8;
+    let mut rooks = board.pieces[(us | Piece::ROOK) as usize];
+
+    let friendly_occ = board.pieces[(us | Piece::ALL) as usize];
+    let enemy_occ = board.pieces[(enemy | Piece::ALL) as usize];
+    let total_occ = board.pieces[0];
+
+    while rooks != 0 {
+        let from = rooks.trailing_zeros() as u8;
+
+        // Use magic bitboards to get all attacks
+        let mut attacks = get_rook_attacks(from, total_occ) & !friendly_occ;
+
+        while attacks != 0 {
+            let to = attacks.trailing_zeros() as u8;
+            let to_bit = 1u64 << to;
+
+            let flag = if (to_bit & enemy_occ) != 0 {
+                Move::CAPTURE
+            } else {
+                Move::QUIET
+            };
+
+            moves[*curr_move_index] = Move::new_with_flags(from, to, flag);
+            *curr_move_index += 1;
+
+            attacks &= attacks - 1;
+        }
+
+        rooks &= rooks - 1;
+    }
 }
 
 fn generate_queen_moves(board: &Board, moves: &mut [Move], curr_move_index: &mut usize) {
     let us = if board.white_to_move { Piece::WHITE } else { Piece::BLACK };
-    let queens = board.pieces[(us | Piece::QUEEN) as usize];
+    let enemy = us ^ 8;
+    let mut queens = board.pieces[(us | Piece::QUEEN) as usize];
 
-    // A Queen moves like a Bishop AND a Rook
-    generate_sliding_moves(board, moves, curr_move_index, queens, &BISHOP_SHIFTS);
-    generate_sliding_moves(board, moves, curr_move_index, queens, &ROOK_SHIFTS);
-}
+    let friendly_occ = board.pieces[(us | Piece::ALL) as usize];
+    let enemy_occ = board.pieces[(enemy | Piece::ALL) as usize];
+    let total_occ = board.pieces[0];
 
-fn generate_sliding_moves(
-    board: &Board,
-    moves: &mut [Move],
-    curr_move_index: &mut usize,
-    mut piece_bb: u64, // The bitboard of pieces to generate moves for
-    shifts: &[(i8, u64)], // The directions [(offset, mask)]
-) {
-    let us = if board.white_to_move { Piece::WHITE } else { Piece::BLACK };
+    while queens != 0 {
+        let from = queens.trailing_zeros() as u8;
 
-    while piece_bb != 0 {
-        let from = piece_bb.trailing_zeros() as u8;
-        let from_bit = 1u64 << from;
+        // Use magic bitboards to get all attacks (combination of rook and bishop)
+        let mut attacks = get_queen_attacks(from, total_occ) & !friendly_occ;
 
-        for &(shift, mask) in shifts {
-            let mut current_sq_mask = from_bit;
-            loop {
-                if shift > 0 {
-                    current_sq_mask = (current_sq_mask << shift) & mask;
-                } else {
-                    current_sq_mask = (current_sq_mask >> shift.abs()) & mask;
-                }
+        while attacks != 0 {
+            let to = attacks.trailing_zeros() as u8;
+            let to_bit = 1u64 << to;
 
-                if current_sq_mask == 0 { break; }
+            let flag = if (to_bit & enemy_occ) != 0 {
+                Move::CAPTURE
+            } else {
+                Move::QUIET
+            };
 
-                let to = current_sq_mask.trailing_zeros() as u8;
-                if (current_sq_mask & board.pieces[(us | Piece::ALL) as usize]) != 0 { break; }
+            moves[*curr_move_index] = Move::new_with_flags(from, to, flag);
+            *curr_move_index += 1;
 
-                if (current_sq_mask & board.pieces[((us ^ 8) | Piece::ALL) as usize]) != 0 {
-                    moves[*curr_move_index] = Move::new_with_flags(from, to, Move::CAPTURE);
-                    *curr_move_index += 1;
-                    break;
-                }
-
-                moves[*curr_move_index] = Move::new_with_flags(from, to, Move::QUIET);
-                *curr_move_index += 1;
-            }
+            attacks &= attacks - 1;
         }
-        piece_bb &= piece_bb - 1;
+
+        queens &= queens - 1;
     }
 }
 
@@ -315,37 +359,7 @@ pub fn is_square_attacked(board: &Board, sq: u8, attacker_color: u8) -> bool {
     false
 }
 
-fn get_bishop_attacks(sq: u8, occ: u64) -> u64 {
-    let mut attacks = 0u64;
-    let b_dirs = [(9, NOT_A_FILE), (7, NOT_H_FILE), (-7, NOT_A_FILE), (-9, NOT_H_FILE)];
-
-    for (shift, mask) in b_dirs {
-        let mut current = 1u64 << sq;
-        loop {
-            current = if shift > 0 { (current << shift) & mask } else { (current >> -shift) & mask };
-            if current == 0 { break; }
-            attacks |= current;
-            if (current & occ) != 0 { break; } // Hit any piece
-        }
-    }
-    attacks
-}
-
-fn get_rook_attacks(sq: u8, occ: u64) -> u64 {
-    let mut attacks = 0u64;
-    let r_dirs = [(8, !0), (-8, !0), (1, NOT_A_FILE), (-1, NOT_H_FILE)];
-
-    for (shift, mask) in r_dirs {
-        let mut current = 1u64 << sq;
-        loop {
-            current = if shift > 0 { (current << shift) & mask } else { (current >> -shift) & mask };
-            if current == 0 { break; }
-            attacks |= current;
-            if (current & occ) != 0 { break; } // Hit any piece
-        }
-    }
-    attacks
-}
+// Note: get_bishop_attacks and get_rook_attacks are now imported from magic_bitboards module
 
 // --- HIGH SPEED CAPTURE GENERATOR FOR QUIESCENCE SEARCH ---
 
@@ -455,60 +469,73 @@ fn generate_king_captures(board: &Board, moves: &mut [Move], curr_move_index: &m
 
 fn generate_bishop_captures(board: &Board, moves: &mut [Move], curr_move_index: &mut usize) {
     let us = if board.white_to_move { Piece::WHITE } else { Piece::BLACK };
-    let bishops = board.pieces[(us | Piece::BISHOP) as usize];
-    generate_sliding_captures(board, moves, curr_move_index, bishops, &BISHOP_SHIFTS);
+    let enemy = us ^ 8;
+    let enemy_occ = board.pieces[(enemy | Piece::ALL) as usize];
+    let total_occ = board.pieces[0];
+    let mut bishops = board.pieces[(us | Piece::BISHOP) as usize];
+
+    while bishops != 0 {
+        let from = bishops.trailing_zeros() as u8;
+
+        // Only intersect with enemy pieces for captures
+        let mut attacks = get_bishop_attacks(from, total_occ) & enemy_occ;
+
+        while attacks != 0 {
+            let to = attacks.trailing_zeros() as u8;
+            moves[*curr_move_index] = Move::new_with_flags(from, to, Move::CAPTURE);
+            *curr_move_index += 1;
+            attacks &= attacks - 1;
+        }
+
+        bishops &= bishops - 1;
+    }
 }
 
 fn generate_rook_captures(board: &Board, moves: &mut [Move], curr_move_index: &mut usize) {
     let us = if board.white_to_move { Piece::WHITE } else { Piece::BLACK };
-    let rooks = board.pieces[(us | Piece::ROOK) as usize];
-    generate_sliding_captures(board, moves, curr_move_index, rooks, &ROOK_SHIFTS);
+    let enemy = us ^ 8;
+    let enemy_occ = board.pieces[(enemy | Piece::ALL) as usize];
+    let total_occ = board.pieces[0];
+    let mut rooks = board.pieces[(us | Piece::ROOK) as usize];
+
+    while rooks != 0 {
+        let from = rooks.trailing_zeros() as u8;
+
+        // Only intersect with enemy pieces for captures
+        let mut attacks = get_rook_attacks(from, total_occ) & enemy_occ;
+
+        while attacks != 0 {
+            let to = attacks.trailing_zeros() as u8;
+            moves[*curr_move_index] = Move::new_with_flags(from, to, Move::CAPTURE);
+            *curr_move_index += 1;
+            attacks &= attacks - 1;
+        }
+
+        rooks &= rooks - 1;
+    }
 }
 
 fn generate_queen_captures(board: &Board, moves: &mut [Move], curr_move_index: &mut usize) {
     let us = if board.white_to_move { Piece::WHITE } else { Piece::BLACK };
-    let queens = board.pieces[(us | Piece::QUEEN) as usize];
-    generate_sliding_captures(board, moves, curr_move_index, queens, &BISHOP_SHIFTS);
-    generate_sliding_captures(board, moves, curr_move_index, queens, &ROOK_SHIFTS);
-}
+    let enemy = us ^ 8;
+    let enemy_occ = board.pieces[(enemy | Piece::ALL) as usize];
+    let total_occ = board.pieces[0];
+    let mut queens = board.pieces[(us | Piece::QUEEN) as usize];
 
-fn generate_sliding_captures(
-    board: &Board,
-    moves: &mut [Move],
-    curr_move_index: &mut usize,
-    mut piece_bb: u64,
-    shifts: &[(i8, u64)],
-) {
-    let us = if board.white_to_move { Piece::WHITE } else { Piece::BLACK };
-    let friendly_occ = board.pieces[(us | Piece::ALL) as usize];
-    let enemy_occ = board.pieces[((us ^ 8) | Piece::ALL) as usize];
+    while queens != 0 {
+        let from = queens.trailing_zeros() as u8;
 
-    while piece_bb != 0 {
-        let from = piece_bb.trailing_zeros() as u8;
-        let from_bit = 1u64 << from;
+        // Only intersect with enemy pieces for captures (combination of bishop and rook attacks)
+        let mut attacks = get_queen_attacks(from, total_occ) & enemy_occ;
 
-        for &(shift, mask) in shifts {
-            let mut current_sq_mask = from_bit;
-            loop {
-                if shift > 0 {
-                    current_sq_mask = (current_sq_mask << shift) & mask;
-                } else {
-                    current_sq_mask = (current_sq_mask >> shift.abs()) & mask;
-                }
-
-                if current_sq_mask == 0 { break; } // Off board
-                if (current_sq_mask & friendly_occ) != 0 { break; } // Blocked by own piece
-
-                if (current_sq_mask & enemy_occ) != 0 {
-                    let to = current_sq_mask.trailing_zeros() as u8;
-                    moves[*curr_move_index] = Move::new_with_flags(from, to, Move::CAPTURE);
-                    *curr_move_index += 1;
-                    break; // Stop sliding after hitting enemy piece
-                }
-                // Notice: 'add quiet move' logic is COMPLETELY DELETED
-            }
+        while attacks != 0 {
+            let to = attacks.trailing_zeros() as u8;
+            moves[*curr_move_index] = Move::new_with_flags(from, to, Move::CAPTURE);
+            *curr_move_index += 1;
+            attacks &= attacks - 1;
         }
-        piece_bb &= piece_bb - 1;
+
+        queens &= queens - 1;
     }
 }
 
@@ -579,5 +606,3 @@ pub const NOT_A_FILE: u64 = 0xfefefefefefefefe;
 // 0x7F = 01111111 (H-file is 0)
 pub const NOT_H_FILE: u64 = 0x7f7f7f7f7f7f7f7f;
 
-const BISHOP_SHIFTS: [(i8, u64); 4] = [(9, NOT_A_FILE), (7, NOT_H_FILE), (-7, NOT_A_FILE), (-9, NOT_H_FILE)];
-const ROOK_SHIFTS: [(i8, u64); 4] = [(8, !0), (-8, !0), (1, NOT_A_FILE), (-1, NOT_H_FILE)];

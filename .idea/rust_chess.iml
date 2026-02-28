@@ -6,6 +6,8 @@
       <sourceFolder url="file://$MODULE_DIR$/chess_engine/benches" isTestSource="true" />
       <sourceFolder url="file://$MODULE_DIR$/chess_engine/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/chess_engine/examples" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/generate_magics/src" isTestSource="false" />
       <excludeFolder url="file://$MODULE_DIR$/chess_GUI/target" />
       <excludeFolder url="file://$MODULE_DIR$/chess_engine/target" />
       <excludeFolder url="file://$MODULE_DIR$/target" />

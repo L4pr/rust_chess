@@ -62,9 +62,16 @@ pub fn perft2(board: &mut Board, depth: usize) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::move_generation::magic_bitboards::init_magic_bitboards;
+
+    // Helper to ensure magic bitboards are initialized before any test
+    fn setup() {
+        init_magic_bitboards();
+    }
 
     #[test]
     fn test_generate_moves_report() {
+        setup();
         let board = Board::starting_position();
         let expected = [
             (1, 20),
@@ -95,6 +102,7 @@ mod tests {
 
     #[test]
     fn test_fen() {
+        setup();
         let initial_fen = "rnbqkbnr/pppp1ppp/4p3/4P3/8/8/PPPP1PPP/RNBQKBNR w KQkq - 0 1";
         let board = Board::from_fen(initial_fen);
 
@@ -103,6 +111,7 @@ mod tests {
 
     /// Helper function to run perft tests cleanly
     fn run_perft_test(fen: &str, expected: &[(usize, u64)]) {
+        setup();
         let board = Board::from_fen(fen);
         for &(depth, target) in expected {
             // We clone the board so the original isn't mutated during tests

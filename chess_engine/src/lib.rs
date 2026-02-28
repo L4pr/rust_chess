@@ -17,3 +17,4 @@ pub use move_generation::book::OpeningBook;
 pub use board::evaluation::evaluate;
 pub use board::board::is_draw_by_repetition;
 pub use move_generation::generate_moves::generate_captures;
+pub use move_generation::magic_bitboards::init_magic_bitboards;

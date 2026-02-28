@@ -2,11 +2,14 @@ use criterion::{criterion_group, criterion_main, Criterion, BatchSize};
 use std::hint::black_box;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use chess_engine::{Board, perft, ZobristKeys};
+use chess_engine::{Board, perft, ZobristKeys, init_magic_bitboards};
 use chess_engine::engine::{alpha_beta, TranspositionTable};
 use chess_engine::move_generation::tests::perft2;
 
 fn bench_pawn_generation(crit: &mut Criterion) {
+    // Initialize magic bitboards once
+    init_magic_bitboards();
+
     let mut board = Board::starting_position();
 
     crit.bench_function("generate_moves", |b| {
@@ -25,6 +28,9 @@ fn bench_pawn_generation(crit: &mut Criterion) {
 }
 
 fn bench_alpha_beta(crit: &mut Criterion) {
+    // Initialize magic bitboards once
+    init_magic_bitboards();
+
     let board = Board::starting_position();
     let zobrist = ZobristKeys::new();
     let abort = Arc::new(AtomicBool::new(false));

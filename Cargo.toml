@@ -1,7 +1,8 @@
 [workspace]
 members = [
     "chess_GUI",
-    "chess_engine"
+    "chess_engine",
+    "generate_magics"
 ]
 
 resolver = "3"
