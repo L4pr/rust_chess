@@ -12,6 +12,74 @@ const INF: i32 = i32::MAX - 1;
 const MAX_PLY: u32 = 90;
 const MAX_MOVES: usize = 218;
 
+// Move ordering bonus values
+const TT_MOVE_BONUS: i32 = 100_000;
+const PROMOTE_BONUS: i32 = 90_000;
+const CAPTURE_BASE: i32 = 50_000;  // + MVV-LVA value
+const KILLER_BONUS_0: i32 = 40_000;
+const KILLER_BONUS_1: i32 = 39_000;
+// History scores fill 0..~MAX_HISTORY
+
+const DELTA_MARGIN: i32 = 200; // for delta pruning in qsearch
+
+// ==========================================
+// Search state passed through the tree
+// ==========================================
+
+struct SearchState {
+    killers: [[Option<Move>; 2]; MAX_PLY as usize],
+    history: [[i32; 64]; 16], // indexed by piece (us|pt) and to_sq
+    nodes: u64,
+}
+
+impl SearchState {
+    fn new() -> Self {
+        SearchState {
+            killers: [[None; 2]; MAX_PLY as usize],
+            history: [[0; 64]; 16],
+            nodes: 0,
+        }
+    }
+
+    #[inline]
+    fn store_killer(&mut self, ply: u32, m: Move) {
+        let p = ply as usize;
+        if self.killers[p][0] != Some(m) {
+            self.killers[p][1] = self.killers[p][0];
+            self.killers[p][0] = Some(m);
+        }
+    }
+
+    #[inline]
+    fn update_history(&mut self, board: &Board, m: Move, depth: u32) {
+        let us = if board.white_to_move { Piece::WHITE } else { Piece::BLACK };
+        let from_bit = 1u64 << m.from_sq();
+        let piece_idx = find_piece_index(board, us, from_bit) as usize;
+        let bonus = (depth * depth) as i32;
+        let h = &mut self.history[piece_idx][m.to_sq() as usize];
+        // Gravity: prevent unbounded growth
+        *h += bonus - (*h * bonus.abs() / 16384);
+    }
+
+    #[inline]
+    fn get_history(&self, board: &Board, m: Move) -> i32 {
+        let us = if board.white_to_move { Piece::WHITE } else { Piece::BLACK };
+        let from_bit = 1u64 << m.from_sq();
+        let piece_idx = find_piece_index(board, us, from_bit) as usize;
+        self.history[piece_idx][m.to_sq() as usize]
+    }
+}
+
+#[inline]
+fn find_piece_index(board: &Board, us: u8, from_bit: u64) -> u8 {
+    for pt in [Piece::PAWN, Piece::KNIGHT, Piece::BISHOP, Piece::ROOK, Piece::QUEEN, Piece::KING] {
+        if board.pieces[(us | pt) as usize] & from_bit != 0 {
+            return us | pt;
+        }
+    }
+    0
+}
+
 // ==========================================
 // Reusable Helper Functions
 // ==========================================
@@ -36,9 +104,9 @@ fn gives_check(board: &Board, us: u8, enemy: u8) -> bool {
 }
 
 #[inline]
-fn check_time_abort(nodes: &mut u64, abort: &Arc<AtomicBool>) -> bool {
-    *nodes += 1;
-    (*nodes & 2047 == 0) && abort.load(Ordering::Relaxed)
+fn check_time_abort(ss: &mut SearchState, abort: &Arc<AtomicBool>) -> bool {
+    ss.nodes += 1;
+    (ss.nodes & 2047 == 0) && abort.load(Ordering::Relaxed)
 }
 
 #[inline]
@@ -76,6 +144,30 @@ fn pick_next_best_move(moves: &mut [Move], scores: &mut [i32], start_idx: usize,
     }
     moves.swap(start_idx, best_idx);
     scores.swap(start_idx, best_idx);
+}
+
+// MVV-LVA: Most Valuable Victim – Least Valuable Attacker
+#[inline]
+fn mvv_lva(board: &Board, m: Move) -> i32 {
+    let to_bit = 1u64 << m.to_sq();
+    let from_bit = 1u64 << m.from_sq();
+    let (us, them) = get_colors(board);
+
+    let victim = if m.flags() == Move::EN_PASSANT { 100 }
+    else if (board.pieces[(them | Piece::QUEEN) as usize] & to_bit) != 0 { 900 }
+    else if (board.pieces[(them | Piece::ROOK) as usize] & to_bit) != 0 { 500 }
+    else if (board.pieces[(them | Piece::BISHOP) as usize] & to_bit) != 0 { 330 }
+    else if (board.pieces[(them | Piece::KNIGHT) as usize] & to_bit) != 0 { 320 }
+    else { 100 }; // pawn
+
+    let attacker = if (board.pieces[(us | Piece::PAWN) as usize] & from_bit) != 0 { 100 }
+    else if (board.pieces[(us | Piece::KNIGHT) as usize] & from_bit) != 0 { 320 }
+    else if (board.pieces[(us | Piece::BISHOP) as usize] & from_bit) != 0 { 330 }
+    else if (board.pieces[(us | Piece::ROOK) as usize] & from_bit) != 0 { 500 }
+    else if (board.pieces[(us | Piece::QUEEN) as usize] & from_bit) != 0 { 900 }
+    else { 0 }; // king
+
+    victim * 10 - attacker
 }
 
 // ==========================================
@@ -128,52 +220,73 @@ impl Engine {
             test_board.make_move(m);
 
             if is_move_legal(&test_board, us, enemy) {
-                root_moves.push(RootMove { m, score: score_move(m, None) });
+                root_moves.push(RootMove { m, score: 0 });
             }
         }
 
         if root_moves.is_empty() { return None; }
 
-        let mut nodes = 0;
+        let mut ss = SearchState::new();
         let mut absolute_best_move = root_moves[0].m;
         let mut absolute_best_score = -INF;
         let mut depth_searched = 0;
         let mut history_stack = Vec::with_capacity(1024);
 
-        for depth in 1..25 {
+        for depth in 1..25u32 {
             root_moves.sort_by(|a, b| b.score.cmp(&a.score));
 
-            let mut alpha = -INF;
-            let beta = INF;
-            let mut search_aborted = false;
+            // Aspiration window: narrow search around previous best score
+            let (mut alpha, mut beta) = if depth >= 4 && absolute_best_score.abs() < MATE_BOUND {
+                (absolute_best_score - 50, absolute_best_score + 50)
+            } else {
+                (-INF, INF)
+            };
 
-            let mut current_depth_best_move = root_moves[0].m;
-            let mut current_depth_best_score = -INF;
+            let mut search_aborted;
+            let mut current_depth_best_move;
+            let mut current_depth_best_score;
 
-            for root_move in root_moves.iter_mut() {
-                let m = root_move.m;
-                let mut new_board = self.board;
-                let current_hash = self.board.zobrist_hash;
+            // Aspiration window loop: widen if search falls outside window
+            loop {
+                search_aborted = false;
+                current_depth_best_move = root_moves[0].m;
+                current_depth_best_score = -INF;
 
-                new_board.make_move(m);
-                let extension = if gives_check(&new_board, us, enemy) { 1 } else { 0 };
+                for root_move in root_moves.iter_mut() {
+                    let m = root_move.m;
+                    let mut new_board = self.board;
+                    let current_hash = self.board.zobrist_hash;
 
-                history_stack.push(current_hash);
-                let score = -alpha_beta(&new_board, -beta, -alpha, depth - 1 + extension, 1, &abort, &mut nodes, &mut self.tt, &mut history_stack);
-                history_stack.pop();
+                    new_board.make_move(m);
+                    let extension = if gives_check(&new_board, us, enemy) { 1 } else { 0 };
 
-                if abort.load(Ordering::Relaxed) {
-                    search_aborted = true;
-                    break;
+                    history_stack.push(current_hash);
+                    let score = -alpha_beta(&new_board, -beta, -alpha, depth - 1 + extension, 1, &abort, &mut ss, &mut self.tt, &mut history_stack);
+                    history_stack.pop();
+
+                    if abort.load(Ordering::Relaxed) {
+                        search_aborted = true;
+                        break;
+                    }
+
+                    root_move.score = score;
+
+                    if score > current_depth_best_score {
+                        current_depth_best_score = score;
+                        current_depth_best_move = m;
+                    }
+                    if score > alpha { alpha = score; }
                 }
 
-                root_move.score = score;
+                if search_aborted { break; }
 
-                if score > current_depth_best_score {
-                    current_depth_best_score = score;
-                    current_depth_best_move = m;
+                // If score fell outside aspiration window, widen and re-search
+                if current_depth_best_score <= alpha - 50 || current_depth_best_score >= beta {
+                    alpha = -INF;
+                    beta = INF;
+                    continue; // re-search with full window
                 }
-                alpha = alpha.max(score);
+                break;
             }
 
             if search_aborted {
@@ -187,22 +300,36 @@ impl Engine {
             absolute_best_score = current_depth_best_score;
             depth_searched = depth;
 
+            println!("info depth {} score {} nodes {} pv {}",
+                     depth_searched, format_score(absolute_best_score), ss.nodes, absolute_best_move.to_uci());
+
             if absolute_best_score > MATE_BOUND { break; }
         }
 
         println!("info depth {} score {} nodes {} pv {}",
-                 depth_searched, format_score(absolute_best_score), nodes, absolute_best_move.to_uci());
+                 depth_searched, format_score(absolute_best_score), ss.nodes, absolute_best_move.to_uci());
 
         Some(absolute_best_move)
     }
 }
 
-pub fn alpha_beta(
+/// Public entry point for benchmarking the search.
+/// Creates a fresh SearchState and TT, then runs alpha_beta at the given depth.
+/// Returns (score, nodes_searched).
+pub fn bench_search(board: &Board, depth: u32, abort: &Arc<AtomicBool>) -> (i32, u64) {
+    let mut ss = SearchState::new();
+    let mut tt = TranspositionTable::new(2);
+    let mut history: Vec<u64> = Vec::with_capacity(1024);
+    let score = alpha_beta(board, -INF, INF, depth, 0, abort, &mut ss, &mut tt, &mut history);
+    (score, ss.nodes)
+}
+
+fn alpha_beta(
     board: &Board, mut alpha: i32, mut beta: i32, depth: u32, ply: u32,
-    abort: &Arc<AtomicBool>, nodes: &mut u64, tt: &mut TranspositionTable,
+    abort: &Arc<AtomicBool>, ss: &mut SearchState, tt: &mut TranspositionTable,
     history: &mut Vec<u64>,
 ) -> i32 {
-    if check_time_abort(nodes, abort) { return 0; }
+    if check_time_abort(ss, abort) { return 0; }
 
     if ply >= MAX_PLY {
         return board.evaluate_board();
@@ -230,16 +357,15 @@ pub fn alpha_beta(
         }
     }
 
-    let depth = if depth == 0 && board.is_in_check() { 1 } else { depth };
-    if depth == 0 { return quiescence_search(board, alpha, beta, abort, nodes); }
+    let in_check = board.is_in_check();
+    let depth = if depth == 0 && in_check { 1 } else { depth };
+    if depth == 0 { return quiescence_search(board, alpha, beta, abort, ss); }
 
     // --- Null Move Pruning ---
-    if depth >= 3 && !board.is_in_check() && board.has_non_pawn_material() {
+    if depth >= 3 && !in_check && board.has_non_pawn_material() {
         let mut null_board = *board;
         let z = zobrist();
-        // Flip side to move
         null_board.zobrist_hash ^= z.black_to_move;
-        // Remove old en passant from hash
         if let Some(ep_sq) = null_board.en_passant_square {
             null_board.zobrist_hash ^= z.en_passant[(ep_sq % 8) as usize];
         }
@@ -247,7 +373,7 @@ pub fn alpha_beta(
         null_board.en_passant_square = None;
 
         let r = if depth >= 6 { 3 } else { 2 };
-        let null_score = -alpha_beta(&null_board, -beta, -beta + 1, depth - 1 - r, ply + 1, abort, nodes, tt, history);
+        let null_score = -alpha_beta(&null_board, -beta, -beta + 1, depth - 1 - r, ply + 1, abort, ss, tt, history);
 
         if null_score >= beta {
             return beta;
@@ -258,8 +384,23 @@ pub fn alpha_beta(
     let mut scores = [0i32; MAX_MOVES];
     let count = generate_all_moves(board, &mut moves);
 
+    // Score moves with TT move, killers, MVV-LVA, and history
+    let killers = ss.killers[ply as usize];
     for i in 0..count {
-        scores[i] = score_move(moves[i], tt_move);
+        let m = moves[i];
+        if Some(m) == tt_move {
+            scores[i] = TT_MOVE_BONUS;
+        } else if m.is_promotion() {
+            scores[i] = PROMOTE_BONUS;
+        } else if m.is_capture() {
+            scores[i] = CAPTURE_BASE + mvv_lva(board, m);
+        } else if Some(m) == killers[0] {
+            scores[i] = KILLER_BONUS_0;
+        } else if Some(m) == killers[1] {
+            scores[i] = KILLER_BONUS_1;
+        } else {
+            scores[i] = ss.get_history(board, m);
+        }
     }
 
     let (us, enemy) = get_colors(board);
@@ -281,16 +422,24 @@ pub fn alpha_beta(
 
         // --- Late Move Reductions ---
         let mut reduction = 0;
-        if depth >= 3 && legal_moves > 3 && extension == 0 && !m.is_capture() && !m.is_promotion() {
+        if depth >= 3 && legal_moves > 3 && extension == 0 && !m.is_capture() && !m.is_promotion() && !in_check {
             reduction = 1;
+            if legal_moves > 6 { reduction += 1; }
         }
 
         history.push(hash_key);
-        let mut score = -alpha_beta(&new_board, -beta, -alpha, depth - 1 + extension - reduction, ply + 1, abort, nodes, tt, history);
+        let mut score;
 
-        // Re-search at full depth if reduced search found something good
-        if reduction > 0 && score > alpha {
-            score = -alpha_beta(&new_board, -beta, -alpha, depth - 1 + extension, ply + 1, abort, nodes, tt, history);
+        // PVS: First move gets full window, rest get null window first
+        if legal_moves == 1 {
+            score = -alpha_beta(&new_board, -beta, -alpha, depth - 1 + extension, ply + 1, abort, ss, tt, history);
+        } else {
+            // Scout search with null window
+            score = -alpha_beta(&new_board, -alpha - 1, -alpha, depth - 1 + extension - reduction, ply + 1, abort, ss, tt, history);
+            // Re-search if it improved alpha
+            if score > alpha && (reduction > 0 || score < beta) {
+                score = -alpha_beta(&new_board, -beta, -alpha, depth - 1 + extension, ply + 1, abort, ss, tt, history);
+            }
         }
         history.pop();
 
@@ -302,6 +451,11 @@ pub fn alpha_beta(
         }
 
         if score >= beta {
+            // Store killer and history for quiet moves that cause cutoffs
+            if !m.is_capture() && !m.is_promotion() {
+                ss.store_killer(ply, m);
+                ss.update_history(board, m, depth);
+            }
             tt.store(hash_key, depth, score_to_tt(best_score, ply), TTFlag::LowerBound, best_move);
             return best_score;
         }
@@ -310,7 +464,7 @@ pub fn alpha_beta(
 
     // Terminal Node Handling
     if legal_moves == 0 {
-        best_score = if gives_check(board, enemy, us) { -MATE_SCORE + (ply as i32) } else { 0 };
+        best_score = if in_check { -MATE_SCORE + (ply as i32) } else { 0 };
         tt.store(hash_key, depth, score_to_tt(best_score, ply), TTFlag::Exact, None);
         return best_score;
     }
@@ -319,14 +473,6 @@ pub fn alpha_beta(
     tt.store(hash_key, depth, score_to_tt(best_score, ply), tt_flag, best_move);
 
     best_score
-}
-
-fn score_move(m: Move, tt_move: Option<Move>) -> i32 {
-    if Some(m) == tt_move { return 10_000; }
-    let mut score = 0;
-    if m.is_capture() { score += 1_000; }
-    if m.is_promotion() { score += 900; }
-    score
 }
 
 #[derive(Copy, Clone)]
@@ -376,30 +522,8 @@ impl TranspositionTable {
     }
 }
 
-fn score_capture_qs(board: &Board, m: Move) -> i32 {
-    let to_bit = 1u64 << m.to_sq();
-    let from_bit = 1u64 << m.from_sq();
-    let (us, them) = get_colors(board);
-
-    let victim_val = if m.flags() == Move::EN_PASSANT { 100 }
-    else if (board.pieces[(them | Piece::QUEEN) as usize] & to_bit) != 0 { 900 }
-    else if (board.pieces[(them | Piece::ROOK) as usize] & to_bit) != 0 { 500 }
-    else if (board.pieces[(them | Piece::BISHOP) as usize] & to_bit) != 0 { 330 }
-    else if (board.pieces[(them | Piece::KNIGHT) as usize] & to_bit) != 0 { 320 }
-    else { 100 };
-
-    let attacker_val = if (board.pieces[(us | Piece::PAWN) as usize] & from_bit) != 0 { 100 }
-    else if (board.pieces[(us | Piece::KNIGHT) as usize] & from_bit) != 0 { 320 }
-    else if (board.pieces[(us | Piece::BISHOP) as usize] & from_bit) != 0 { 330 }
-    else if (board.pieces[(us | Piece::ROOK) as usize] & from_bit) != 0 { 500 }
-    else if (board.pieces[(us | Piece::QUEEN) as usize] & from_bit) != 0 { 900 }
-    else { 20000 };
-
-    (victim_val * 10) - attacker_val + if m.is_promotion() { 900 } else { 0 }
-}
-
-pub fn quiescence_search(board: &Board, mut alpha: i32, beta: i32, abort: &Arc<AtomicBool>, nodes: &mut u64) -> i32 {
-    if check_time_abort(nodes, abort) { return 0; }
+fn quiescence_search(board: &Board, mut alpha: i32, beta: i32, abort: &Arc<AtomicBool>, ss: &mut SearchState) -> i32 {
+    if check_time_abort(ss, abort) { return 0; }
 
     let stand_pat = board.evaluate_board();
     if stand_pat >= beta { return stand_pat; }
@@ -411,19 +535,24 @@ pub fn quiescence_search(board: &Board, mut alpha: i32, beta: i32, abort: &Arc<A
     let (us, enemy) = get_colors(board);
 
     for i in 0..count {
-        scores[i] = score_capture_qs(board, captures[i]);
+        scores[i] = mvv_lva(board, captures[i]) + if captures[i].is_promotion() { 900 } else { 0 };
     }
 
     for i in 0..count {
         pick_next_best_move(&mut captures, &mut scores, i, count);
         let m = captures[i];
 
+        // Delta pruning: skip captures that can't possibly raise alpha
+        if !m.is_promotion() && stand_pat + scores[i] / 10 + DELTA_MARGIN < alpha {
+            continue;
+        }
+
         let mut new_board = *board;
         new_board.make_move(m);
 
         if !is_move_legal(&new_board, us, enemy) { continue; }
 
-        let score = -quiescence_search(&new_board, -beta, -alpha, abort, nodes);
+        let score = -quiescence_search(&new_board, -beta, -alpha, abort, ss);
 
         if abort.load(Ordering::Relaxed) { return 0; }
 
