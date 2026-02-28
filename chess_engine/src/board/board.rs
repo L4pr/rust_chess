@@ -106,38 +106,27 @@ impl Board {
             let mut empty_count = 0;
             for col in 0..8 {
                 let square = row * 8 + col;
-                let bit = 1u64 << square;
+                let piece = self.mailbox[square];
 
-                let mut piece_char = None;
-
-                let piece_types = [
-                    (Piece::PAWN, 'P'),
-                    (Piece::KNIGHT, 'N'),
-                    (Piece::BISHOP, 'B'),
-                    (Piece::ROOK, 'R'),
-                    (Piece::QUEEN, 'Q'),
-                    (Piece::KING, 'K'),
-                ];
-
-                for &(pt, c) in &piece_types {
-                    if (self.pieces[(Piece::WHITE | pt) as usize] & bit) != 0 {
-                        piece_char = Some(c);
-                        break;
-                    }
-                    if (self.pieces[(Piece::BLACK | pt) as usize] & bit) != 0 {
-                        piece_char = Some(c.to_ascii_lowercase());
-                        break;
-                    }
-                }
-
-                if let Some(c) = piece_char {
+                if piece == EMPTY {
+                    empty_count += 1;
+                } else {
                     if empty_count > 0 {
                         fen.push_str(&empty_count.to_string());
                         empty_count = 0;
                     }
-                    fen.push(c);
-                } else {
-                    empty_count += 1;
+                    let pt = piece & 0x07;
+                    let ch = match pt {
+                        Piece::PAWN => 'p',
+                        Piece::KNIGHT => 'n',
+                        Piece::BISHOP => 'b',
+                        Piece::ROOK => 'r',
+                        Piece::QUEEN => 'q',
+                        Piece::KING => 'k',
+                        _ => '?',
+                    };
+                    let is_white = (piece & 0x08) == 0;
+                    fen.push(if is_white { ch.to_ascii_uppercase() } else { ch });
                 }
             }
 

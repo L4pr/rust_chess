@@ -424,12 +424,18 @@ fn alpha_beta(
     // ---- Reverse Futility Pruning (Static Null Move Pruning) ----
     // If we're already so far ahead that even after subtracting a margin we still beat beta,
     // it's extremely unlikely any move will change that. Skip the search.
-    if !is_pv && !in_check && depth <= 6 && static_eval - RFP_MARGIN * (depth as i32) >= beta {
+    // NEVER prune when mate scores are involved — we need to find the actual mate.
+    if !is_pv && !in_check && depth <= 6
+        && static_eval - RFP_MARGIN * (depth as i32) >= beta
+        && beta.abs() < MATE_BOUND
+    {
         return static_eval;
     }
 
     // --- Null Move Pruning ---
-    if !is_pv && depth >= 3 && !in_check && board.has_non_pawn_material() && static_eval >= beta {
+    if !is_pv && depth >= 3 && !in_check && board.has_non_pawn_material()
+        && static_eval >= beta && beta.abs() < MATE_BOUND
+    {
         let mut null_board = *board;
         let z = zobrist();
         null_board.zobrist_hash ^= z.black_to_move;
@@ -479,7 +485,8 @@ fn alpha_beta(
     let mut best_score = -INF;
     let mut best_move = None;
     let futility_pruning = !is_pv && !in_check && depth <= 3
-        && static_eval + FUTILITY_MARGIN * (depth as i32) <= alpha;
+        && static_eval + FUTILITY_MARGIN * (depth as i32) <= alpha
+        && alpha.abs() < MATE_BOUND;
 
     // Track quiet moves searched so we can penalize them on cutoffs
     let mut quiets_searched = [Move(0); MAX_MOVES];
@@ -508,6 +515,7 @@ fn alpha_beta(
         // ---- Late Move Pruning ----
         // At very low depths, after trying enough moves, stop generating quiet moves
         if !is_pv && depth <= 3 && is_quiet && !in_check
+            && best_score.abs() < MATE_BOUND
             && legal_moves > (3 + 4 * depth as usize) {
             continue;
         }
@@ -647,18 +655,10 @@ fn quiescence_search(board: &Board, mut alpha: i32, beta: i32, abort: &Arc<Atomi
     if check_time_abort(ss, abort) { return 0; }
 
     let in_check = board.is_in_check();
-
-    // If in check, we can't stand pat — we must search evasions
-    if !in_check {
-        let stand_pat = board.evaluate_board();
-        if stand_pat >= beta { return stand_pat; }
-        alpha = alpha.max(stand_pat);
-    }
-
     let (us, enemy) = get_colors(board);
 
+    // If in check, we can't stand pat — we must search all evasions
     if in_check {
-        // In check: search ALL moves (evasions), not just captures
         let mut moves = [Move(0); MAX_MOVES];
         let count = generate_all_moves(board, &mut moves);
         let mut legal_moves = 0;
@@ -687,39 +687,44 @@ fn quiescence_search(board: &Board, mut alpha: i32, beta: i32, abort: &Arc<Atomi
             alpha = alpha.max(score);
         }
 
-        // If no legal moves while in check = checkmate
+        // No legal moves while in check = checkmate
         if legal_moves == 0 { return -MATE_SCORE; }
-    } else {
-        // Not in check: only search captures + promotions
-        let stand_pat = board.evaluate_board();
-        let mut captures = [Move(0); MAX_MOVES];
-        let mut scores = [0i32; MAX_MOVES];
-        let count = generate_captures(board, &mut captures);
+        return alpha;
+    }
 
-        for i in 0..count {
-            scores[i] = mvv_lva(board, captures[i]) + if captures[i].is_promotion() { 900 } else { 0 };
+    // Not in check: stand pat
+    let stand_pat = board.evaluate_board();
+    if stand_pat >= beta { return stand_pat; }
+    alpha = alpha.max(stand_pat);
+
+    // Only search captures + promotions
+    let mut captures = [Move(0); MAX_MOVES];
+    let mut scores = [0i32; MAX_MOVES];
+    let count = generate_captures(board, &mut captures);
+
+    for i in 0..count {
+        scores[i] = mvv_lva(board, captures[i]) + if captures[i].is_promotion() { 900 } else { 0 };
+    }
+
+    for i in 0..count {
+        pick_next_best_move(&mut captures, &mut scores, i, count);
+        let m = captures[i];
+
+        // Delta pruning: skip captures that can't possibly raise alpha
+        if !m.is_promotion() && stand_pat + scores[i] / 10 + DELTA_MARGIN < alpha {
+            continue;
         }
 
-        for i in 0..count {
-            pick_next_best_move(&mut captures, &mut scores, i, count);
-            let m = captures[i];
+        let mut new_board = *board;
+        new_board.make_move(m);
 
-            // Delta pruning: skip captures that can't possibly raise alpha
-            if !m.is_promotion() && stand_pat + scores[i] / 10 + DELTA_MARGIN < alpha {
-                continue;
-            }
+        if !is_move_legal(&new_board, us, enemy) { continue; }
 
-            let mut new_board = *board;
-            new_board.make_move(m);
+        let score = -quiescence_search(&new_board, -beta, -alpha, abort, ss);
 
-            if !is_move_legal(&new_board, us, enemy) { continue; }
-
-            let score = -quiescence_search(&new_board, -beta, -alpha, abort, ss);
-
-            if abort.load(Ordering::Relaxed) { return 0; }
-            if score >= beta { return beta; }
-            alpha = alpha.max(score);
-        }
+        if abort.load(Ordering::Relaxed) { return 0; }
+        if score >= beta { return beta; }
+        alpha = alpha.max(score);
     }
 
     alpha
