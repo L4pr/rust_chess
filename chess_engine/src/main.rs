@@ -1,6 +1,6 @@
 use std::io::{self, BufRead, Write};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -21,12 +21,18 @@ fn main() {
     let engine = Arc::new(Mutex::new(Engine::new()));
     let abort = Arc::new(AtomicBool::new(false));
     let mut board = Board::starting_position();
+    let mut game_history: Vec<u64> = Vec::new();
 
     // Channel for search/ponder results
     let (msg_tx, msg_rx) = mpsc::channel::<SearchMsg>();
 
     // Track whether a background ponder is running
     let mut ponder_pending = false;
+
+    // Generation counter: incremented on each new "go" command.
+    // Timer threads capture the current generation; if it's stale when they
+    // wake up, they know a new search has started and do NOT set abort.
+    let search_gen = Arc::new(AtomicU64::new(0));
 
     let stdin = io::stdin();
     for line in stdin.lock().lines() {
@@ -53,29 +59,39 @@ fn main() {
                 stop_ponder(&abort, &msg_rx, &mut ponder_pending);
                 engine.lock().unwrap().clear_tt();
                 board = Board::starting_position();
+                game_history.clear();
             }
 
             "position" => {
                 stop_ponder(&abort, &msg_rx, &mut ponder_pending);
-                parse_position(&mut board, &parts, &cmd);
+                game_history.clear();
+                parse_position(&mut board, &parts, &cmd, &mut game_history);
             }
 
             "go" => {
                 stop_ponder(&abort, &msg_rx, &mut ponder_pending);
                 abort.store(false, Ordering::SeqCst);
 
+                // Bump generation so any old timer threads become stale
+                let generation = search_gen.fetch_add(1, Ordering::SeqCst) + 1;
+
                 let time_limit = parse_go(&parts, &board);
                 let board_clone = board;
                 let abort_clone = Arc::clone(&abort);
                 let engine_clone = Arc::clone(&engine);
                 let tx = msg_tx.clone();
+                let history_clone = game_history.clone();
 
-                // Timer thread
+                // Timer thread: only abort if this generation is still current
                 if time_limit < u64::MAX {
                     let abort_timer = Arc::clone(&abort);
+                    let gen_ref = Arc::clone(&search_gen);
                     thread::spawn(move || {
                         thread::sleep(Duration::from_millis(time_limit));
-                        abort_timer.store(true, Ordering::SeqCst);
+                        // Only abort if no newer search has started
+                        if gen_ref.load(Ordering::SeqCst) == generation {
+                            abort_timer.store(true, Ordering::SeqCst);
+                        }
                     });
                 }
 
@@ -83,6 +99,7 @@ fn main() {
                 thread::spawn(move || {
                     let mut eng = engine_clone.lock().unwrap();
                     eng.set_board(board_clone);
+                    eng.set_game_history(history_clone);
                     if let Some(result) = eng.think(abort_clone) {
                         let _ = tx.send(SearchMsg::Done(result));
                     }
@@ -185,7 +202,7 @@ fn stop_ponder(abort: &Arc<AtomicBool>, rx: &mpsc::Receiver<SearchMsg>, ponder_p
 // UCI Parsing
 // ============================================================
 
-fn parse_position(board: &mut Board, parts: &[&str], cmd: &str) {
+fn parse_position(board: &mut Board, parts: &[&str], cmd: &str, game_history: &mut Vec<u64>) {
     if parts.len() > 1 && parts[1] == "startpos" {
         *board = Board::starting_position();
     } else if parts.len() > 1 && parts[1] == "fen" {
@@ -193,10 +210,14 @@ fn parse_position(board: &mut Board, parts: &[&str], cmd: &str) {
         *board = Board::from_fen(fen_part);
     }
 
+    // Record the initial position hash
+    game_history.push(board.zobrist_hash);
+
     if let Some(moves_idx) = cmd.find(" moves ") {
         for move_str in cmd[moves_idx + 7..].split_whitespace() {
             if let Some(m) = board.parse_uci_to_move(move_str) {
                 board.make_move(m);
+                game_history.push(board.zobrist_hash);
             } else {
                 eprintln!("info string Error: Illegal move '{}'", move_str);
             }

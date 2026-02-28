@@ -169,9 +169,15 @@ fn score_to_tt(mut score: i32, ply: u32) -> i32 {
 #[inline]
 fn format_score(score: i32) -> String {
     if score > MATE_BOUND {
-        format!("mate {}", ((MATE_SCORE - score) + 1) / 2)
+        // We're delivering mate: distance in full moves = ceil((MATE_SCORE - score) / 2)
+        let plies = MATE_SCORE - score; // plies until mate
+        let moves = (plies + 1) / 2;   // convert to full moves (round up)
+        format!("mate {}", moves)
     } else if score < -MATE_BOUND {
-        format!("mate -{}", ((MATE_SCORE + score) + 1) / 2)
+        // We're getting mated: distance in full moves
+        let plies = MATE_SCORE + score; // plies until we get mated
+        let moves = (plies + 1) / 2;
+        format!("mate -{}", moves.max(1)) // at minimum "mate -1"
     } else {
         format!("cp {}", score)
     }
@@ -222,6 +228,7 @@ pub struct Engine {
     board: Board,
     tt: TranspositionTable,
     book: OpeningBook,
+    game_history: Vec<u64>,
 }
 
 /// Result of a search: the best move, and optionally the predicted opponent reply.
@@ -236,6 +243,7 @@ impl Engine {
             board: Board::starting_position(),
             tt: TranspositionTable::new(64),
             book: OpeningBook::load_from_file(),
+            game_history: Vec::new(),
         }
     }
 
@@ -245,6 +253,10 @@ impl Engine {
 
     pub fn set_board(&mut self, new_board: Board) {
         self.board = new_board;
+    }
+
+    pub fn set_game_history(&mut self, history: Vec<u64>) {
+        self.game_history = history;
     }
 
     /// Run an infinite ponder search on the given board (the position after
@@ -269,11 +281,11 @@ impl Engine {
         if root_moves.is_empty() { return; }
 
         let mut ss = SearchState::new();
-        let mut history_stack = Vec::with_capacity(1024);
+        let mut history_stack = self.game_history.clone();
         let mut best_score = -INF;
 
         // Iterative deepening — runs until aborted
-        for depth in 1..25u32 {
+        for depth in 1..64u32 {
             root_moves.sort_by(|a, b| b.score.cmp(&a.score));
 
             let (mut alpha, beta) = if depth >= 4 && best_score.abs() < MATE_BOUND {
@@ -288,10 +300,11 @@ impl Engine {
                 let mut new_board = self.board;
                 let hash = self.board.zobrist_hash;
                 new_board.make_move(m);
-                let ext = if gives_check(&new_board, us, enemy) { 1 } else { 0 };
+                let child_in_check = gives_check(&new_board, us, enemy);
+                let ext = if child_in_check { 1 } else { 0 };
 
                 history_stack.push(hash);
-                let score = -alpha_beta(&new_board, -beta, -alpha, depth - 1 + ext, 1, &abort, &mut ss, &mut self.tt, &mut history_stack);
+                let score = -alpha_beta(&new_board, -beta, -alpha, depth - 1 + ext, 1, child_in_check, &abort, &mut ss, &mut self.tt, &mut history_stack);
                 history_stack.pop();
 
                 if abort.load(Ordering::Relaxed) { aborted = true; break; }
@@ -343,9 +356,9 @@ impl Engine {
         let mut absolute_best_move = root_moves[0].m;
         let mut absolute_best_score = -INF;
         let mut depth_searched = 0;
-        let mut history_stack = Vec::with_capacity(1024);
+        let mut history_stack = self.game_history.clone();
 
-        for depth in 1..25u32 {
+        for depth in 1..64u32 {
             root_moves.sort_by(|a, b| b.score.cmp(&a.score));
 
             // Aspiration window: narrow search around previous best score
@@ -364,17 +377,33 @@ impl Engine {
                 search_aborted = false;
                 current_depth_best_move = root_moves[0].m;
                 current_depth_best_score = -INF;
+                let original_alpha = alpha;
 
-                for root_move in root_moves.iter_mut() {
+                for (move_idx, root_move) in root_moves.iter_mut().enumerate() {
                     let m = root_move.m;
                     let mut new_board = self.board;
                     let current_hash = self.board.zobrist_hash;
 
                     new_board.make_move(m);
-                    let extension = if gives_check(&new_board, us, enemy) { 1 } else { 0 };
+                    let child_in_check = gives_check(&new_board, us, enemy);
+                    let extension = if child_in_check { 1 } else { 0 };
 
                     history_stack.push(current_hash);
-                    let score = -alpha_beta(&new_board, -beta, -alpha, depth - 1 + extension, 1, &abort, &mut ss, &mut self.tt, &mut history_stack);
+
+                    let score;
+                    if move_idx == 0 {
+                        // First move: full window search
+                        score = -alpha_beta(&new_board, -beta, -alpha, depth - 1 + extension, 1, child_in_check, &abort, &mut ss, &mut self.tt, &mut history_stack);
+                    } else {
+                        // PVS: null window first
+                        let mut s = -alpha_beta(&new_board, -alpha - 1, -alpha, depth - 1 + extension, 1, child_in_check, &abort, &mut ss, &mut self.tt, &mut history_stack);
+                        // Re-search with full window if it beats alpha
+                        if s > alpha && s < beta {
+                            s = -alpha_beta(&new_board, -beta, -alpha, depth - 1 + extension, 1, child_in_check, &abort, &mut ss, &mut self.tt, &mut history_stack);
+                        }
+                        score = s;
+                    }
+
                     history_stack.pop();
 
                     if abort.load(Ordering::Relaxed) {
@@ -393,19 +422,20 @@ impl Engine {
 
                 if search_aborted { break; }
 
-                // Widen aspiration window gradually
-                if current_depth_best_score <= alpha.saturating_sub(window) {
+                // Fail-low: best score didn't exceed the original alpha
+                if current_depth_best_score <= original_alpha {
                     window *= 4;
-                    alpha = absolute_best_score.saturating_sub(window);
-                    beta = absolute_best_score.saturating_add(window);
-                    if window > 1000 { alpha = -INF; beta = INF; }
+                    if window > 1000 { alpha = -INF; beta = INF; } else {
+                        alpha = (absolute_best_score - window).max(-INF);
+                    }
                     continue;
                 }
+                // Fail-high: widen beta upward
                 if current_depth_best_score >= beta {
                     window *= 4;
-                    alpha = absolute_best_score.saturating_sub(window);
-                    beta = absolute_best_score.saturating_add(window);
-                    if window > 1000 { alpha = -INF; beta = INF; }
+                    if window > 1000 { alpha = -INF; beta = INF; } else {
+                        beta = (absolute_best_score + window).min(INF);
+                    }
                     continue;
                 }
                 break;
@@ -425,7 +455,8 @@ impl Engine {
             println!("info depth {} score {} nodes {} pv {}",
                      depth_searched, format_score(absolute_best_score), ss.nodes, absolute_best_move.to_uci());
 
-            if absolute_best_score > MATE_BOUND { break; }
+            // Stop early if we found a forced mate (winning or losing)
+            if absolute_best_score.abs() > MATE_BOUND { break; }
         }
 
         println!("info depth {} score {} nodes {} pv {}",
@@ -435,7 +466,7 @@ impl Engine {
         let ponder_move = {
             let mut next = self.board;
             next.make_move(absolute_best_move);
-            self.tt.probe(next.zobrist_hash).and_then(|entry| entry.best_move)
+            self.tt.probe(next.zobrist_hash).and_then(|(_, _, _, best)| best)
         };
 
         Some(SearchResult { best_move: absolute_best_move, ponder_move })
@@ -447,12 +478,13 @@ pub fn bench_search(board: &Board, depth: u32, abort: &Arc<AtomicBool>) -> (i32,
     let mut ss = SearchState::new();
     let mut tt = TranspositionTable::new(2);
     let mut history: Vec<u64> = Vec::with_capacity(1024);
-    let score = alpha_beta(board, -INF, INF, depth, 0, abort, &mut ss, &mut tt, &mut history);
+    let in_check = board.is_in_check();
+    let score = alpha_beta(board, -INF, INF, depth, 0, in_check, abort, &mut ss, &mut tt, &mut history);
     (score, ss.nodes)
 }
 
 fn alpha_beta(
-    board: &Board, mut alpha: i32, mut beta: i32, depth: u32, ply: u32,
+    board: &Board, mut alpha: i32, mut beta: i32, depth: u32, ply: u32, in_check: bool,
     abort: &Arc<AtomicBool>, ss: &mut SearchState, tt: &mut TranspositionTable,
     history: &mut Vec<u64>,
 ) -> i32 {
@@ -472,12 +504,12 @@ fn alpha_beta(
     let original_alpha = alpha;
     let mut tt_move = None;
 
-    if let Some(entry) = tt.probe(hash_key) {
-        tt_move = entry.best_move;
+    if let Some((flag, tt_depth, raw_score, tt_best)) = tt.probe(hash_key) {
+        tt_move = tt_best;
         // Only use TT cutoffs in non-PV nodes
-        if !is_pv && entry.depth >= depth {
-            let tt_score = score_from_tt(entry.score, ply);
-            match entry.flag {
+        if !is_pv && tt_depth as u32 >= depth {
+            let tt_score = score_from_tt(raw_score, ply);
+            match flag {
                 TTFlag::Exact => return tt_score,
                 TTFlag::LowerBound => alpha = alpha.max(tt_score),
                 TTFlag::UpperBound => beta = beta.min(tt_score),
@@ -486,23 +518,39 @@ fn alpha_beta(
         }
     }
 
-    let in_check = board.is_in_check();
     let depth = if depth == 0 && in_check { 1 } else { depth };
-    if depth == 0 { return quiescence_search(board, alpha, beta, abort, ss); }
+    if depth == 0 { return quiescence_search(board, alpha, beta, 0, in_check, abort, ss, tt); }
+
+    // Internal Iterative Reduction (IIR): if no TT move at sufficient depth,
+    // reduce depth by 1. This effectively does a shallow search first to
+    // populate the TT, improving move ordering on the next iteration.
+    let depth = if tt_move.is_none() && depth >= 4 { depth - 1 } else { depth };
 
     // Static eval for pruning decisions
-    let static_eval = board.evaluate_board();
+    let static_eval = if in_check { -INF } else { board.evaluate_board() };
     ss.eval_stack[ply as usize] = static_eval;
 
     // Is our position improving compared to 2 plies ago?
-    let improving = ply >= 2 && static_eval > ss.eval_stack[(ply - 2) as usize];
+    let improving = ply >= 2 && !in_check && static_eval > ss.eval_stack[(ply - 2) as usize];
+
+    // ---- Razoring ----
+    // If static eval is far below alpha at low depth, a full search is unlikely
+    // to raise it. Drop directly into qsearch to save time.
+    if !is_pv && !in_check && depth <= 3
+        && static_eval + 300 * (depth as i32) <= alpha
+        && alpha.abs() < MATE_BOUND
+    {
+        let razor_score = quiescence_search(board, alpha, beta, 0, false, abort, ss, tt);
+        if razor_score <= alpha { return razor_score; }
+    }
 
     // ---- Reverse Futility Pruning (Static Null Move Pruning) ----
     // If we're already so far ahead that even after subtracting a margin we still beat beta,
     // it's extremely unlikely any move will change that. Skip the search.
     // NEVER prune when mate scores are involved — we need to find the actual mate.
-    if !is_pv && !in_check && depth <= 6
-        && static_eval - RFP_MARGIN * (depth as i32) >= beta
+    let rfp_margin = RFP_MARGIN * (depth as i32) - if improving { 60 } else { 0 };
+    if !is_pv && !in_check && depth <= 7
+        && static_eval - rfp_margin >= beta
         && beta.abs() < MATE_BOUND
     {
         return static_eval;
@@ -522,7 +570,7 @@ fn alpha_beta(
         null_board.en_passant_square = None;
 
         let r = 3 + depth / 4 + ((static_eval - beta) / 200).min(3) as u32;
-        let null_score = -alpha_beta(&null_board, -beta, -beta + 1, depth.saturating_sub(r + 1), ply + 1, abort, ss, tt, history);
+        let null_score = -alpha_beta(&null_board, -beta, -beta + 1, depth.saturating_sub(r + 1), ply + 1, false, abort, ss, tt, history);
 
         if null_score >= beta {
             // Don't return unproven mate scores from null move
@@ -579,7 +627,8 @@ fn alpha_beta(
 
         legal_moves += 1;
         let is_quiet = !m.is_capture() && !m.is_promotion();
-        let extension = if gives_check(&new_board, us, enemy) { 1 } else { 0 };
+        let child_in_check = gives_check(&new_board, us, enemy);
+        let extension = if child_in_check { 1 } else { 0 };
 
         // ---- Futility Pruning ----
         // At low depths, if static eval + margin is still below alpha,
@@ -598,17 +647,22 @@ fn alpha_beta(
 
         // ---- Late Move Reductions ----
         let mut reduction: u32 = 0;
-        if depth >= 3 && legal_moves > 1 && is_quiet && extension == 0 && !in_check {
-            let d = (depth as usize).min(63);
-            let m_idx = (legal_moves as usize).min(63);
-            reduction = LMR_TABLE[d][m_idx];
+        if depth >= 3 && legal_moves > 1 && extension == 0 && !in_check {
+            if is_quiet {
+                let d = (depth as usize).min(63);
+                let m_idx = (legal_moves as usize).min(63);
+                reduction = LMR_TABLE[d][m_idx];
 
-            // Reduce less in PV nodes
-            if is_pv && reduction > 0 { reduction -= 1; }
-            // Reduce less if position is improving
-            if improving && reduction > 0 { reduction -= 1; }
-            // Reduce more for moves with bad history
-            if ss.get_history(board, m) < -1000 { reduction += 1; }
+                // Reduce less in PV nodes
+                if is_pv && reduction > 0 { reduction -= 1; }
+                // Reduce less if position is improving
+                if improving && reduction > 0 { reduction -= 1; }
+                // Reduce more for moves with bad history
+                if ss.get_history(board, m) < -1000 { reduction += 1; }
+            } else if legal_moves > 6 {
+                // Reduce late captures by 1 (less aggressive than quiet LMR)
+                reduction = 1;
+            }
 
             // Don't reduce into qsearch (ensure at least depth 1)
             reduction = reduction.min(depth - 1);
@@ -619,17 +673,17 @@ fn alpha_beta(
 
         // PVS: First move gets full window, rest get null window first
         if legal_moves == 1 {
-            score = -alpha_beta(&new_board, -beta, -alpha, depth - 1 + extension, ply + 1, abort, ss, tt, history);
+            score = -alpha_beta(&new_board, -beta, -alpha, depth - 1 + extension, ply + 1, child_in_check, abort, ss, tt, history);
         } else {
             // Scout search with null window + reduction
-            score = -alpha_beta(&new_board, -alpha - 1, -alpha, depth - 1 + extension - reduction, ply + 1, abort, ss, tt, history);
+            score = -alpha_beta(&new_board, -alpha - 1, -alpha, depth - 1 + extension - reduction, ply + 1, child_in_check, abort, ss, tt, history);
             // Re-search at full depth if reduced search beat alpha
             if score > alpha && reduction > 0 {
-                score = -alpha_beta(&new_board, -alpha - 1, -alpha, depth - 1 + extension, ply + 1, abort, ss, tt, history);
+                score = -alpha_beta(&new_board, -alpha - 1, -alpha, depth - 1 + extension, ply + 1, child_in_check, abort, ss, tt, history);
             }
             // Full PV re-search if scout beat alpha in a PV node
             if score > alpha && score < beta {
-                score = -alpha_beta(&new_board, -beta, -alpha, depth - 1 + extension, ply + 1, abort, ss, tt, history);
+                score = -alpha_beta(&new_board, -beta, -alpha, depth - 1 + extension, ply + 1, child_in_check, abort, ss, tt, history);
             }
         }
         history.pop();
@@ -686,13 +740,34 @@ struct RootMove { m: Move, score: i32 }
 #[derive(Clone, Copy, PartialEq)]
 pub enum TTFlag { Exact, LowerBound, UpperBound }
 
+/// Packed TT entry: 12 bytes (down from ~24)
+/// key32 (4) + score (4) + best_move (2) + depth (1) + flag (1) = 12
 #[derive(Clone, Copy)]
+#[repr(C)]
 pub struct TTEntry {
-    pub key: u64,
-    pub score: i32,
-    pub depth: u32,
-    pub flag: TTFlag,
-    pub best_move: Option<Move>,
+    key32: u32,        // upper 32 bits of zobrist key for verification
+    score: i32,
+    best_move: u16,    // raw Move bits (0 = no move)
+    depth: u8,
+    flag: u8,          // 0=Exact, 1=LowerBound, 2=UpperBound
+}
+
+impl TTEntry {
+    const EMPTY: Self = TTEntry { key32: 0, score: 0, best_move: 0, depth: 0, flag: 0 };
+
+    #[inline]
+    fn get_flag(&self) -> TTFlag {
+        match self.flag {
+            1 => TTFlag::LowerBound,
+            2 => TTFlag::UpperBound,
+            _ => TTFlag::Exact,
+        }
+    }
+
+    #[inline]
+    fn get_move(&self) -> Option<Move> {
+        if self.best_move == 0 { None } else { Some(Move(self.best_move)) }
+    }
 }
 
 pub struct TranspositionTable {
@@ -707,39 +782,65 @@ impl TranspositionTable {
         let capacity = num_entries.next_power_of_two();
 
         Self {
-            entries: vec![TTEntry { key: 0, score: 0, depth: 0, flag: TTFlag::Exact, best_move: None }; capacity],
+            entries: vec![TTEntry::EMPTY; capacity],
             mask: capacity - 1,
         }
     }
 
-    pub fn probe(&self, key: u64) -> Option<TTEntry> {
-        let entry = self.entries[(key as usize) & self.mask];
-        if entry.key == key { Some(entry) } else { None }
+    #[inline]
+    pub fn probe(&self, key: u64) -> Option<(TTFlag, u8, i32, Option<Move>)> {
+        let index = (key as usize) & self.mask;
+        let entry = self.entries[index];
+        if entry.key32 == (key >> 32) as u32 {
+            Some((entry.get_flag(), entry.depth, entry.score, entry.get_move()))
+        } else {
+            None
+        }
     }
 
+    #[inline]
     pub fn store(&mut self, key: u64, depth: u32, score: i32, flag: TTFlag, best_move: Option<Move>) {
         let index = (key as usize) & self.mask;
         let current = self.entries[index];
+        let key32 = (key >> 32) as u32;
 
-        if current.key != key || depth >= current.depth {
-            self.entries[index] = TTEntry { key, score, depth, flag, best_move };
+        // Replace if: different position, or new search is at least as deep
+        if current.key32 != key32 || depth as u8 >= current.depth {
+            self.entries[index] = TTEntry {
+                key32,
+                score,
+                best_move: best_move.map_or(0, |m| m.0),
+                depth: depth as u8,
+                flag: match flag { TTFlag::Exact => 0, TTFlag::LowerBound => 1, TTFlag::UpperBound => 2 },
+            };
         }
     }
 }
 
-fn quiescence_search(board: &Board, mut alpha: i32, beta: i32, abort: &Arc<AtomicBool>, ss: &mut SearchState) -> i32 {
+fn quiescence_search(board: &Board, mut alpha: i32, beta: i32, ply: u32, in_check: bool, abort: &Arc<AtomicBool>, ss: &mut SearchState, tt: &mut TranspositionTable) -> i32 {
     if check_time_abort(ss, abort) { return 0; }
 
-    let in_check = board.is_in_check();
     let (us, enemy) = get_colors(board);
+    let hash_key = board.zobrist_hash;
 
-    // If in check, we can't stand pat — we must search all evasions
-    if in_check {
+    // TT probe in qsearch
+    if let Some((flag, _depth, raw_score, _tt_move)) = tt.probe(hash_key) {
+        let tt_score = score_from_tt(raw_score, ply);
+        match flag {
+            TTFlag::Exact => return tt_score,
+            TTFlag::LowerBound => if tt_score >= beta { return tt_score; },
+            TTFlag::UpperBound => if tt_score <= alpha { return tt_score; },
+        }
+    }
+
+    // If in check and within depth limit, search all evasions
+    if in_check && ply < 8 {
         let mut moves = [Move(0); MAX_MOVES];
         let count = generate_all_moves(board, &mut moves);
         let mut legal_moves = 0;
+        let mut best_score = -INF;
+        let mut best_move = None;
 
-        // Simple ordering: captures first, then quiets
         let mut scores = [0i32; MAX_MOVES];
         for i in 0..count {
             if moves[i].is_capture() {
@@ -756,27 +857,40 @@ fn quiescence_search(board: &Board, mut alpha: i32, beta: i32, abort: &Arc<Atomi
             if !is_move_legal(&new_board, us, enemy) { continue; }
 
             legal_moves += 1;
-            let score = -quiescence_search(&new_board, -beta, -alpha, abort, ss);
+            let child_in_check = gives_check(&new_board, us, enemy);
+            let score = -quiescence_search(&new_board, -beta, -alpha, ply + 1, child_in_check, abort, ss, tt);
 
             if abort.load(Ordering::Relaxed) { return 0; }
-            if score >= beta { return beta; }
-            alpha = alpha.max(score);
+
+            if score > best_score {
+                best_score = score;
+                best_move = Some(m);
+            }
+            if score >= beta {
+                tt.store(hash_key, 0, score_to_tt(score, ply), TTFlag::LowerBound, best_move);
+                return score; // NOT beta — return actual score
+            }
+            if score > alpha { alpha = score; }
         }
 
-        // No legal moves while in check = checkmate
-        if legal_moves == 0 { return -MATE_SCORE; }
-        return alpha;
+        if legal_moves == 0 { return -MATE_SCORE + (ply as i32); }
+        tt.store(hash_key, 0, score_to_tt(best_score, ply), TTFlag::Exact, best_move);
+        return best_score; // NOT alpha — return tracked best_score
     }
 
     // Not in check: stand pat
     let stand_pat = board.evaluate_board();
-    if stand_pat >= beta { return stand_pat; }
-    alpha = alpha.max(stand_pat);
+    if stand_pat >= beta {
+        return stand_pat;
+    }
+    if stand_pat > alpha { alpha = stand_pat; }
 
     // Only search captures + promotions
     let mut captures = [Move(0); MAX_MOVES];
     let mut scores = [0i32; MAX_MOVES];
     let count = generate_captures(board, &mut captures);
+    let mut best_score = stand_pat;
+    let mut best_move = None;
 
     for i in 0..count {
         scores[i] = mvv_lva(board, captures[i]) + if captures[i].is_promotion() { 900 } else { 0 };
@@ -787,7 +901,12 @@ fn quiescence_search(board: &Board, mut alpha: i32, beta: i32, abort: &Arc<Atomi
         let m = captures[i];
 
         // Delta pruning: skip captures that can't possibly raise alpha
-        if !m.is_promotion() && stand_pat + scores[i] / 10 + DELTA_MARGIN < alpha {
+        if !m.is_promotion() && stand_pat + piece_value(board.mailbox[m.to_sq() as usize] & 0x07) + DELTA_MARGIN < alpha {
+            continue;
+        }
+
+        // SEE-like pruning: skip clearly losing captures
+        if !m.is_promotion() && scores[i] < 0 {
             continue;
         }
 
@@ -796,12 +915,25 @@ fn quiescence_search(board: &Board, mut alpha: i32, beta: i32, abort: &Arc<Atomi
 
         if !is_move_legal(&new_board, us, enemy) { continue; }
 
-        let score = -quiescence_search(&new_board, -beta, -alpha, abort, ss);
+        let child_in_check = gives_check(&new_board, us, enemy);
+        let score = -quiescence_search(&new_board, -beta, -alpha, ply + 1, child_in_check, abort, ss, tt);
 
         if abort.load(Ordering::Relaxed) { return 0; }
-        if score >= beta { return beta; }
-        alpha = alpha.max(score);
+
+        if score > best_score {
+            best_score = score;
+            best_move = Some(m);
+        }
+        if score >= beta {
+            tt.store(hash_key, 0, score_to_tt(score, ply), TTFlag::LowerBound, best_move);
+            return score; // NOT beta — return actual score
+        }
+        if score > alpha { alpha = score; }
     }
 
-    alpha
+    if best_score > stand_pat {
+        tt.store(hash_key, 0, score_to_tt(best_score, ply), TTFlag::Exact, best_move);
+    }
+
+    best_score // NOT alpha — return tracked best_score
 }
