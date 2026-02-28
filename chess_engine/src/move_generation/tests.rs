@@ -63,10 +63,12 @@ pub fn perft2(board: &mut Board, depth: usize) -> u64 {
 mod tests {
     use super::*;
     use crate::move_generation::magic_bitboards::init_magic_bitboards;
+    use crate::board::zobrist::init_zobrist;
 
-    // Helper to ensure magic bitboards are initialized before any test
+    // Helper to ensure magic bitboards and zobrist keys are initialized before any test
     fn setup() {
         init_magic_bitboards();
+        init_zobrist();
     }
 
     #[test]

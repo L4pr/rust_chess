@@ -2,13 +2,13 @@ use criterion::{criterion_group, criterion_main, Criterion, BatchSize};
 use std::hint::black_box;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use chess_engine::{Board, perft, ZobristKeys, init_magic_bitboards};
+use chess_engine::{Board, perft, init_magic_bitboards, init_zobrist};
 use chess_engine::engine::{alpha_beta, TranspositionTable};
 use chess_engine::move_generation::tests::perft2;
 
 fn bench_pawn_generation(crit: &mut Criterion) {
-    // Initialize magic bitboards once
     init_magic_bitboards();
+    init_zobrist();
 
     let mut board = Board::starting_position();
 
@@ -28,11 +28,10 @@ fn bench_pawn_generation(crit: &mut Criterion) {
 }
 
 fn bench_alpha_beta(crit: &mut Criterion) {
-    // Initialize magic bitboards once
     init_magic_bitboards();
+    init_zobrist();
 
     let board = Board::starting_position();
-    let zobrist = ZobristKeys::new();
     let abort = Arc::new(AtomicBool::new(false));
 
     // We use a small depth (like 5) so the benchmark runs in a reasonable time
@@ -42,7 +41,6 @@ fn bench_alpha_beta(crit: &mut Criterion) {
         b.iter_batched(
             || {
                 // SETUP PHASE: Runs before every iteration (NOT timed).
-                // Create a fresh 2MB TT and reset the node counter so it doesn't just read the cache.
                 let tt = TranspositionTable::new(2);
                 let nodes = 0u64;
                 let history_stack: Vec<u64> = Vec::with_capacity(1024);
@@ -59,7 +57,6 @@ fn bench_alpha_beta(crit: &mut Criterion) {
                     &abort,
                     &mut nodes,
                     &mut tt,
-                    &zobrist,
                     &mut history_stack,
                 );
 

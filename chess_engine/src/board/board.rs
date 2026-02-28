@@ -1,4 +1,5 @@
 use crate::{Move, Piece, CastlingRights, generate_all_moves, is_square_attacked, evaluate};
+use crate::board::zobrist::{zobrist, ZobristKeys};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Board {
@@ -7,6 +8,7 @@ pub struct Board {
     pub en_passant_square: Option<u8>,
     pub castling_rights: CastlingRights,
     pub halfmove_clock: u32,
+    pub zobrist_hash: u64,
 }
 
 impl Board {
@@ -21,6 +23,7 @@ impl Board {
             en_passant_square: None,
             castling_rights: CastlingRights::new(0),
             halfmove_clock: 0,
+            zobrist_hash: 0,
         };
 
         let parts: Vec<&str> = fen.split_whitespace().collect();
@@ -83,6 +86,9 @@ impl Board {
         if parts.len() > 4 {
             board.halfmove_clock = parts[4].parse().unwrap_or(0);
         }
+
+        // Compute full zobrist hash from scratch
+        board.zobrist_hash = zobrist().hash(&board);
 
         board
     }
@@ -205,6 +211,14 @@ impl Board {
         let us = if self.white_to_move { Piece::WHITE } else { Piece::BLACK };
         let them = us ^ 8;
 
+        let z = zobrist();
+
+        // XOR out old castling rights and en passant
+        self.zobrist_hash ^= z.castling[(self.castling_rights.0 & 0b1111) as usize];
+        if let Some(ep_sq) = self.en_passant_square {
+            self.zobrist_hash ^= z.en_passant[(ep_sq % 8) as usize];
+        }
+
         let mut moved_piece_type = Piece::PAWN;
         for pt in [Piece::PAWN, Piece::KNIGHT, Piece::BISHOP, Piece::ROOK, Piece::QUEEN, Piece::KING] {
             if (self.pieces[(us | pt) as usize] & from_bit) != 0 {
@@ -219,28 +233,39 @@ impl Board {
             self.halfmove_clock += 1;
         }
 
+        // Remove captured piece
         if m.is_capture() && flags != Move::EN_PASSANT {
             for pt in [Piece::PAWN, Piece::KNIGHT, Piece::BISHOP, Piece::ROOK, Piece::QUEEN, Piece::KING] {
                 if (self.pieces[(them | pt) as usize] & to_bit) != 0 {
                     self.pieces[(them | pt) as usize] ^= to_bit;
                     self.pieces[(them | Piece::ALL) as usize] ^= to_bit;
+                    self.zobrist_hash ^= z.pieces[ZobristKeys::piece_index(them, pt)][to as usize];
                     break;
                 }
             }
         }
 
+        // Move the piece (XOR out from old square, XOR in to new square)
+        let zi = ZobristKeys::piece_index(us, moved_piece_type);
+        self.zobrist_hash ^= z.pieces[zi][from as usize];
+        self.zobrist_hash ^= z.pieces[zi][to as usize];
         self.pieces[(us | moved_piece_type) as usize] ^= move_mask;
         self.pieces[(us | Piece::ALL) as usize] ^= move_mask;
 
+        // En passant capture
         if flags == Move::EN_PASSANT {
             let capture_sq = if self.white_to_move { to - 8 } else { to + 8 };
             let cap_bit = 1u64 << capture_sq;
             self.pieces[(them | Piece::PAWN) as usize] ^= cap_bit;
             self.pieces[(them | Piece::ALL) as usize] ^= cap_bit;
+            self.zobrist_hash ^= z.pieces[ZobristKeys::piece_index(them, Piece::PAWN)][capture_sq as usize];
         }
 
+        // Promotion: remove pawn, add promoted piece
         if m.is_promotion() {
             self.pieces[(us | Piece::PAWN) as usize] ^= to_bit;
+            self.zobrist_hash ^= z.pieces[ZobristKeys::piece_index(us, Piece::PAWN)][to as usize];
+
             let promo_type = match flags {
                 Move::PR_KNIGHT | Move::PC_KNIGHT => Piece::KNIGHT,
                 Move::PR_BISHOP | Move::PC_BISHOP => Piece::BISHOP,
@@ -248,28 +273,46 @@ impl Board {
                 _ => Piece::QUEEN,
             };
             self.pieces[(us | promo_type) as usize] ^= to_bit;
+            self.zobrist_hash ^= z.pieces[ZobristKeys::piece_index(us, promo_type)][to as usize];
         }
 
+        // Castling rook movement
         if flags == Move::KING_CASTLE {
             let (r_from, r_to) = if self.white_to_move { (7, 5) } else { (63, 61) };
             let r_mask = (1u64 << r_from) | (1u64 << r_to);
             self.pieces[(us | Piece::ROOK) as usize] ^= r_mask;
             self.pieces[(us | Piece::ALL) as usize] ^= r_mask;
+            let ri = ZobristKeys::piece_index(us, Piece::ROOK);
+            self.zobrist_hash ^= z.pieces[ri][r_from as usize];
+            self.zobrist_hash ^= z.pieces[ri][r_to as usize];
         } else if flags == Move::QUEEN_CASTLE {
             let (r_from, r_to) = if self.white_to_move { (0, 3) } else { (56, 59) };
             let r_mask = (1u64 << r_from) | (1u64 << r_to);
             self.pieces[(us | Piece::ROOK) as usize] ^= r_mask;
             self.pieces[(us | Piece::ALL) as usize] ^= r_mask;
+            let ri = ZobristKeys::piece_index(us, Piece::ROOK);
+            self.zobrist_hash ^= z.pieces[ri][r_from as usize];
+            self.zobrist_hash ^= z.pieces[ri][r_to as usize];
         }
 
+        // En passant square
         self.en_passant_square = if flags == Move::DOUBLE_PAWN_PUSH {
-            Some(if self.white_to_move { from + 8 } else { from - 8 })
+            let ep = if self.white_to_move { from + 8 } else { from - 8 };
+            self.zobrist_hash ^= z.en_passant[(ep % 8) as usize];
+            Some(ep)
         } else {
             None
         };
 
         self.update_castling_rights(from, to);
+
+        // XOR in new castling rights
+        self.zobrist_hash ^= z.castling[(self.castling_rights.0 & 0b1111) as usize];
+
+        // Flip side to move
         self.white_to_move = !self.white_to_move;
+        self.zobrist_hash ^= z.black_to_move;
+
         self.pieces[0] = self.pieces[7] | self.pieces[15];
     }
 

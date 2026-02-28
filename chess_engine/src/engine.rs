@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use crate::{Board, Move, generate_all_moves, is_square_attacked, Piece, ZobristKeys, OpeningBook, is_draw_by_repetition, generate_captures};
+use crate::{Board, Move, generate_all_moves, is_square_attacked, Piece, OpeningBook, is_draw_by_repetition, generate_captures};
+use crate::board::zobrist::zobrist;
 
 // ==========================================
 // Constants
@@ -83,7 +84,6 @@ fn pick_next_best_move(moves: &mut [Move], scores: &mut [i32], start_idx: usize,
 
 pub struct Engine {
     board: Board,
-    zobrist: ZobristKeys,
     tt: TranspositionTable,
     book: OpeningBook,
 }
@@ -92,7 +92,6 @@ impl Engine {
     pub fn new() -> Self {
         Engine {
             board: Board::starting_position(),
-            zobrist: ZobristKeys::new(),
             tt: TranspositionTable::new(64),
             book: OpeningBook::load_from_file(),
         }
@@ -154,13 +153,13 @@ impl Engine {
             for root_move in root_moves.iter_mut() {
                 let m = root_move.m;
                 let mut new_board = self.board;
-                let current_hash = self.zobrist.hash(&self.board);
+                let current_hash = self.board.zobrist_hash;
 
                 new_board.make_move(m);
                 let extension = if gives_check(&new_board, us, enemy) { 1 } else { 0 };
 
                 history_stack.push(current_hash);
-                let score = -alpha_beta(&new_board, -beta, -alpha, depth - 1 + extension, 1, &abort, &mut nodes, &mut self.tt, &self.zobrist, &mut history_stack);
+                let score = -alpha_beta(&new_board, -beta, -alpha, depth - 1 + extension, 1, &abort, &mut nodes, &mut self.tt, &mut history_stack);
                 history_stack.pop();
 
                 if abort.load(Ordering::Relaxed) {
@@ -201,7 +200,7 @@ impl Engine {
 pub fn alpha_beta(
     board: &Board, mut alpha: i32, mut beta: i32, depth: u32, ply: u32,
     abort: &Arc<AtomicBool>, nodes: &mut u64, tt: &mut TranspositionTable,
-    zobrist: &ZobristKeys, history: &mut Vec<u64>,
+    history: &mut Vec<u64>,
 ) -> i32 {
     if check_time_abort(nodes, abort) { return 0; }
 
@@ -209,7 +208,7 @@ pub fn alpha_beta(
         return board.evaluate_board();
     }
 
-    let hash_key = zobrist.hash(board);
+    let hash_key = board.zobrist_hash;
 
     if ply > 0 && (board.halfmove_clock >= 100 || is_draw_by_repetition(board.halfmove_clock, history, hash_key)) {
         return 0;
@@ -237,11 +236,18 @@ pub fn alpha_beta(
     // --- Null Move Pruning ---
     if depth >= 3 && !board.is_in_check() && board.has_non_pawn_material() {
         let mut null_board = *board;
+        let z = zobrist();
+        // Flip side to move
+        null_board.zobrist_hash ^= z.black_to_move;
+        // Remove old en passant from hash
+        if let Some(ep_sq) = null_board.en_passant_square {
+            null_board.zobrist_hash ^= z.en_passant[(ep_sq % 8) as usize];
+        }
         null_board.white_to_move = !null_board.white_to_move;
         null_board.en_passant_square = None;
 
         let r = if depth >= 6 { 3 } else { 2 };
-        let null_score = -alpha_beta(&null_board, -beta, -beta + 1, depth - 1 - r, ply + 1, abort, nodes, tt, zobrist, history);
+        let null_score = -alpha_beta(&null_board, -beta, -beta + 1, depth - 1 - r, ply + 1, abort, nodes, tt, history);
 
         if null_score >= beta {
             return beta;
@@ -280,11 +286,11 @@ pub fn alpha_beta(
         }
 
         history.push(hash_key);
-        let mut score = -alpha_beta(&new_board, -beta, -alpha, depth - 1 + extension - reduction, ply + 1, abort, nodes, tt, zobrist, history);
+        let mut score = -alpha_beta(&new_board, -beta, -alpha, depth - 1 + extension - reduction, ply + 1, abort, nodes, tt, history);
 
         // Re-search at full depth if reduced search found something good
         if reduction > 0 && score > alpha {
-            score = -alpha_beta(&new_board, -beta, -alpha, depth - 1 + extension, ply + 1, abort, nodes, tt, zobrist, history);
+            score = -alpha_beta(&new_board, -beta, -alpha, depth - 1 + extension, ply + 1, abort, nodes, tt, history);
         }
         history.pop();
 

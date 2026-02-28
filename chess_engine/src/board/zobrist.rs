@@ -1,10 +1,25 @@
 use crate::{Board, Piece};
+use std::sync::OnceLock;
 
 pub struct ZobristKeys {
     pub pieces: [[u64; 64]; 12], // 12 piece types (6 white, 6 black) across 64 squares
     pub black_to_move: u64,
     pub castling: [u64; 16],     // 16 possible castling right combinations
     pub en_passant: [u64; 8],    // 8 possible files for en passant
+}
+
+/// Global Zobrist keys, initialized once and accessible from anywhere.
+static ZOBRIST: OnceLock<ZobristKeys> = OnceLock::new();
+
+/// Initialize the global Zobrist keys. Call once at startup.
+pub fn init_zobrist() {
+    ZOBRIST.get_or_init(ZobristKeys::new);
+}
+
+/// Get a reference to the global Zobrist keys.
+#[inline]
+pub fn zobrist() -> &'static ZobristKeys {
+    ZOBRIST.get().expect("Zobrist keys not initialized")
 }
 
 impl ZobristKeys {
@@ -37,39 +52,41 @@ impl ZobristKeys {
         keys
     }
 
+    /// Map a piece bitboard index (like WHITE|PAWN = 1, BLACK|KNIGHT = 10)
+    /// to the Zobrist piece index (0..11).
+    #[inline]
+    pub fn piece_index(color: u8, piece_type: u8) -> usize {
+        // WHITE pieces: color=0, types 1-6 → indices 0-5
+        // BLACK pieces: color=8, types 1-6 → indices 6-11
+        let color_offset = if color == Piece::BLACK { 6 } else { 0 };
+        (piece_type as usize - 1) + color_offset
+    }
+
+    /// Compute a full hash from scratch (used for initialization / verification).
     pub fn hash(&self, board: &Board) -> u64 {
-        let mut hash = 0;
+        let mut hash = 0u64;
 
-        // 1. Hash the pieces
-        for sq in 0..64 {
-            let bit = 1u64 << sq;
-            // Iterate through White (0-5) and Black (6-11) pieces
-            // Assuming your Piece types are indexed easily. For your bitboards:
-            let piece_types = [
-                Piece::WHITE | Piece::PAWN, Piece::WHITE | Piece::KNIGHT, Piece::WHITE | Piece::BISHOP,
-                Piece::WHITE | Piece::ROOK, Piece::WHITE | Piece::QUEEN, Piece::WHITE | Piece::KING,
-                Piece::BLACK | Piece::PAWN, Piece::BLACK | Piece::KNIGHT, Piece::BLACK | Piece::BISHOP,
-                Piece::BLACK | Piece::ROOK, Piece::BLACK | Piece::QUEEN, Piece::BLACK | Piece::KING,
-            ];
+        let piece_types = [
+            Piece::WHITE | Piece::PAWN, Piece::WHITE | Piece::KNIGHT, Piece::WHITE | Piece::BISHOP,
+            Piece::WHITE | Piece::ROOK, Piece::WHITE | Piece::QUEEN, Piece::WHITE | Piece::KING,
+            Piece::BLACK | Piece::PAWN, Piece::BLACK | Piece::KNIGHT, Piece::BLACK | Piece::BISHOP,
+            Piece::BLACK | Piece::ROOK, Piece::BLACK | Piece::QUEEN, Piece::BLACK | Piece::KING,
+        ];
 
-            for (i, &pt) in piece_types.iter().enumerate() {
-                if (board.pieces[pt as usize] & bit) != 0 {
-                    hash ^= self.pieces[i][sq];
-                    break;
-                }
+        for (i, &pt) in piece_types.iter().enumerate() {
+            let mut bb = board.pieces[pt as usize];
+            while bb != 0 {
+                let sq = bb.trailing_zeros() as usize;
+                hash ^= self.pieces[i][sq];
+                bb &= bb - 1;
             }
         }
 
-        // 2. Hash side to move
         if !board.white_to_move { hash ^= self.black_to_move; }
-
-        // 3. Hash castling rights
         hash ^= self.castling[(board.castling_rights.0 & 0b1111) as usize];
 
-        // 4. Hash en passant
         if let Some(ep_sq) = board.en_passant_square {
-            let file = (ep_sq % 8) as usize;
-            hash ^= self.en_passant[file];
+            hash ^= self.en_passant[(ep_sq % 8) as usize];
         }
 
         hash

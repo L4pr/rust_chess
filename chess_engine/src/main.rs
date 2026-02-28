@@ -2,12 +2,13 @@ use std::io::{self, BufRead};
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
-use chess_engine::{Board, Engine, init_magic_bitboards};
+use chess_engine::{Board, Engine, init_magic_bitboards, init_zobrist};
 
 
 fn main() {
-    // Initialize magic bitboards once at startup
+    // Initialize magic bitboards and zobrist keys once at startup
     init_magic_bitboards();
+    init_zobrist();
     
     let engine = Arc::new(Mutex::new(Engine::new()));
     // This flag allows the main loop to tell the search thread to stop!

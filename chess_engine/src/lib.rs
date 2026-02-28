@@ -13,6 +13,7 @@ pub use move_generation::generate_moves::is_square_attacked;
 pub use move_generation::tests::perft;
 pub use move_generation::tests::perft2;
 pub use board::zobrist::ZobristKeys;
+pub use board::zobrist::{init_zobrist, zobrist};
 pub use move_generation::book::OpeningBook;
 pub use board::evaluation::evaluate;
 pub use board::board::is_draw_by_repetition;

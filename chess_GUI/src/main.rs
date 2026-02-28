@@ -3,7 +3,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{channel, Receiver};
 use std::thread;
-use chess_engine::{Board, Move, Piece, generate_all_moves, is_square_attacked};
+use chess_engine::{Board, Move, Piece, generate_all_moves, is_square_attacked, init_magic_bitboards, init_zobrist};
 
 #[derive(PartialEq, Clone, Copy)]
 enum PlayerType { Human, Engine }
@@ -336,6 +336,9 @@ impl eframe::App for ChessGui {
 }
 
 fn main() -> Result<(), eframe::Error> {
+    init_magic_bitboards();
+    init_zobrist();
+
     let mut options = eframe::NativeOptions::default();
     options.viewport = egui::ViewportBuilder::default()
         .with_inner_size([1200.0, 800.0]);
