@@ -224,6 +224,12 @@ pub struct Engine {
     book: OpeningBook,
 }
 
+/// Result of a search: the best move, and optionally the predicted opponent reply.
+pub struct SearchResult {
+    pub best_move: Move,
+    pub ponder_move: Option<Move>,
+}
+
 impl Engine {
     pub fn new() -> Self {
         Engine {
@@ -241,7 +247,64 @@ impl Engine {
         self.board = new_board;
     }
 
-    pub fn think(&mut self, abort: Arc<AtomicBool>) -> Option<Move> {
+    /// Run an infinite ponder search on the given board (the position after
+    /// our move + predicted opponent move). The search populates the TT so
+    /// if the prediction is correct, the next real search starts warm.
+    pub fn ponder(&mut self, board: Board, abort: Arc<AtomicBool>) {
+        self.board = board;
+
+        let mut move_storage = [Move::new(0, 0); MAX_MOVES];
+        let count = generate_all_moves(&self.board, &mut move_storage);
+        let (us, enemy) = get_colors(&self.board);
+        let mut root_moves = Vec::with_capacity(count);
+
+        for i in 0..count {
+            let m = move_storage[i];
+            let mut test_board = self.board;
+            test_board.make_move(m);
+            if is_move_legal(&test_board, us, enemy) {
+                root_moves.push(RootMove { m, score: 0 });
+            }
+        }
+        if root_moves.is_empty() { return; }
+
+        let mut ss = SearchState::new();
+        let mut history_stack = Vec::with_capacity(1024);
+        let mut best_score = -INF;
+
+        // Iterative deepening — runs until aborted
+        for depth in 1..25u32 {
+            root_moves.sort_by(|a, b| b.score.cmp(&a.score));
+
+            let (mut alpha, beta) = if depth >= 4 && best_score.abs() < MATE_BOUND {
+                (best_score - 50, best_score + 50)
+            } else {
+                (-INF, INF)
+            };
+
+            let mut aborted = false;
+            for root_move in root_moves.iter_mut() {
+                let m = root_move.m;
+                let mut new_board = self.board;
+                let hash = self.board.zobrist_hash;
+                new_board.make_move(m);
+                let ext = if gives_check(&new_board, us, enemy) { 1 } else { 0 };
+
+                history_stack.push(hash);
+                let score = -alpha_beta(&new_board, -beta, -alpha, depth - 1 + ext, 1, &abort, &mut ss, &mut self.tt, &mut history_stack);
+                history_stack.pop();
+
+                if abort.load(Ordering::Relaxed) { aborted = true; break; }
+                root_move.score = score;
+                if score > alpha { alpha = score; }
+            }
+            if aborted { break; }
+            best_score = root_moves.iter().map(|rm| rm.score).max().unwrap_or(-INF);
+            if best_score > MATE_BOUND { break; }
+        }
+    }
+
+    pub fn think(&mut self, abort: Arc<AtomicBool>) -> Option<SearchResult> {
         let book_fen = self.board.to_book_fen();
 
         if let Some(book_move_str) = self.book.get_book_move(&book_fen) {
@@ -249,7 +312,13 @@ impl Engine {
             if !abort.load(Ordering::Relaxed) {
                 std::thread::sleep(std::time::Duration::from_millis(400));
             }
-            return self.board.parse_uci_to_move(&book_move_str);
+            let best = self.board.parse_uci_to_move(&book_move_str)?;
+            // Try to get a ponder move from the book for the next position
+            let mut next = self.board;
+            next.make_move(best);
+            let ponder = self.book.get_book_move(&next.to_book_fen())
+                .and_then(|s| next.parse_uci_to_move(&s));
+            return Some(SearchResult { best_move: best, ponder_move: ponder });
         }
 
         let mut move_storage = [Move::new(0, 0); MAX_MOVES];
@@ -362,7 +431,14 @@ impl Engine {
         println!("info depth {} score {} nodes {} pv {}",
                  depth_searched, format_score(absolute_best_score), ss.nodes, absolute_best_move.to_uci());
 
-        Some(absolute_best_move)
+        // Extract ponder move: look up the TT entry for the position after our best move
+        let ponder_move = {
+            let mut next = self.board;
+            next.make_move(absolute_best_move);
+            self.tt.probe(next.zobrist_hash).and_then(|entry| entry.best_move)
+        };
+
+        Some(SearchResult { best_move: absolute_best_move, ponder_move })
     }
 }
 

@@ -1,168 +1,281 @@
-use std::io::{self, BufRead};
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}, Mutex, mpsc};
+use std::io::{self, BufRead, Write};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Mutex};
 use std::thread;
 use std::time::Duration;
-use chess_engine::{Board, Engine, init_magic_bitboards, init_zobrist};
+use chess_engine::{Board, Engine, Move, SearchResult, init_magic_bitboards, init_zobrist};
 
+/// Message sent from the search/ponder thread back to main.
+enum SearchMsg {
+    /// Real search finished: best move + optional ponder move
+    Done(SearchResult),
+    /// Ponder search was stopped (no result needed from caller)
+    PonderStopped,
+}
 
 fn main() {
-    // Initialize magic bitboards and zobrist keys once at startup
     init_magic_bitboards();
     init_zobrist();
-    
+
     let engine = Arc::new(Mutex::new(Engine::new()));
-    // This flag allows the main loop to tell the search thread to stop!
-    let abort_search = Arc::new(AtomicBool::new(false));
+    let abort = Arc::new(AtomicBool::new(false));
     let mut board = Board::starting_position();
-    
+
+    // Channel for search/ponder results
+    let (msg_tx, msg_rx) = mpsc::channel::<SearchMsg>();
+
+    // Track whether a background ponder is running
+    let mut ponder_pending = false;
+
     let stdin = io::stdin();
     for line in stdin.lock().lines() {
-        let cmd = line.expect("Failed to read line").trim().to_string();
+        let cmd = match line {
+            Ok(l) => l.trim().to_string(),
+            Err(_) => break,
+        };
         if cmd.is_empty() { continue; }
 
         let parts: Vec<&str> = cmd.split_whitespace().collect();
 
         match parts[0] {
-            // 1. GUI says: "Hello, are you a UCI engine?"
             "uci" => {
                 println!("id name rust_chess");
                 println!("id author Renzo");
                 println!("uciok");
             }
-            // 2. GUI says: "Are you done loading your memory?"
+
             "isready" => {
                 println!("readyok");
             }
-            // 3. GUI says: "Start a new game."
+
             "ucinewgame" => {
+                stop_ponder(&abort, &msg_rx, &mut ponder_pending);
                 engine.lock().unwrap().clear_tt();
                 board = Board::starting_position();
             }
-            // 4. GUI says: "Here is the current board."
-            // Example: "position startpos moves e2e4 e7e5"
+
             "position" => {
-                parse_position(&mut board, parts, &cmd);
+                stop_ponder(&abort, &msg_rx, &mut ponder_pending);
+                parse_position(&mut board, &parts, &cmd);
             }
-            // 5. GUI says: "Start calculating the best move!"
+
             "go" => {
-                // Reset the abort flag
-                abort_search.store(false, Ordering::Relaxed);
+                stop_ponder(&abort, &msg_rx, &mut ponder_pending);
+                abort.store(false, Ordering::SeqCst);
 
-                let abort_clone = Arc::clone(&abort_search);
-                let board_clone2 = board.clone();
-
-                let (tx, rx) = mpsc::channel::<()>();
-
-                thread::spawn(move || {
-                    let time_limit = handle_go(&cmd, board_clone2);
-
-                    // Wait for signal OR timeout
-                    match rx.recv_timeout(Duration::from_millis(time_limit as u64)) {
-                        Ok(_) => {
-                            // Search finished early! We received the signal from tx.
-                            // Do nothing and exit.
-                        }
-                        Err(mpsc::RecvTimeoutError::Timeout) => {
-                            // Time is up!
-                            abort_clone.store(true, Ordering::SeqCst);
-                        }
-                        Err(mpsc::RecvTimeoutError::Disconnected) => {
-                            abort_clone.store(true, Ordering::SeqCst);
-                            // Something went wrong, just exit safely.
-                        }
-                    }
-                });
-
-                let board_clone = board.clone();
-                let abort_for_search = Arc::clone(&abort_search);
+                let time_limit = parse_go(&parts, &board);
+                let board_clone = board;
+                let abort_clone = Arc::clone(&abort);
                 let engine_clone = Arc::clone(&engine);
+                let tx = msg_tx.clone();
 
+                // Timer thread
+                if time_limit < u64::MAX {
+                    let abort_timer = Arc::clone(&abort);
+                    thread::spawn(move || {
+                        thread::sleep(Duration::from_millis(time_limit));
+                        abort_timer.store(true, Ordering::SeqCst);
+                    });
+                }
+
+                // Search thread
                 thread::spawn(move || {
                     let mut eng = engine_clone.lock().unwrap();
                     eng.set_board(board_clone);
-                    let bestmove = eng.think(abort_for_search).unwrap();
-                    let _ = tx.send(());
-                    println!("bestmove {}", bestmove.to_uci());
+                    if let Some(result) = eng.think(abort_clone) {
+                        let _ = tx.send(SearchMsg::Done(result));
+                    }
                 });
+
+                // Block until search finishes (timer or "stop" will abort it)
+                if let Ok(SearchMsg::Done(result)) = msg_rx.recv() {
+                    // Format the bestmove output
+                    let mut output = format!("bestmove {}", result.best_move.to_uci());
+                    if let Some(pm) = result.ponder_move {
+                        output.push_str(&format!(" ponder {}", pm.to_uci()));
+                    }
+                    println!("{}", output);
+                    let _ = io::stdout().flush();
+
+                    // Start pondering if we have a predicted opponent move
+                    if let Some(ponder_move) = result.ponder_move {
+                        start_ponder(
+                            &board, result.best_move, ponder_move,
+                            &engine, &abort, &msg_tx, &mut ponder_pending,
+                        );
+                    }
+                }
             }
-            // 6. GUI says: "Stop calculating immediately and give me your best guess!"
+
             "stop" => {
-                abort_search.store(true, Ordering::Relaxed);
+                abort.store(true, Ordering::SeqCst);
             }
+
             "quit" => {
-                abort_search.store(true, Ordering::Relaxed);
+                abort.store(true, Ordering::SeqCst);
                 break;
             }
-            _ => {
-                // Ignore unknown commands (part of the UCI standard)
+
+            "d" | "display" => {
+                print_board(&board);
             }
+
+            _ => {}
         }
     }
 }
 
-fn parse_position(board: &mut Board, parts: Vec<&str>, cmd: &str) {
+// ============================================================
+// Pondering
+// ============================================================
+
+/// Start a background ponder search.
+/// We assume our best move + the predicted opponent reply, then search from there.
+fn start_ponder(
+    board: &Board,
+    our_move: Move,
+    ponder_move: Move,
+    engine: &Arc<Mutex<Engine>>,
+    abort: &Arc<AtomicBool>,
+    tx: &mpsc::Sender<SearchMsg>,
+    ponder_pending: &mut bool,
+) {
+    // Build the ponder board: current → our move → opponent's predicted reply
+    let mut ponder_board = *board;
+    ponder_board.make_move(our_move);
+    ponder_board.make_move(ponder_move);
+
+    // Reset abort for the ponder search
+    abort.store(false, Ordering::SeqCst);
+
+    let engine_clone = Arc::clone(engine);
+    let abort_clone = Arc::clone(abort);
+    let tx_clone = tx.clone();
+
+    thread::spawn(move || {
+        let mut eng = engine_clone.lock().unwrap();
+        eng.ponder(ponder_board, abort_clone);
+        let _ = tx_clone.send(SearchMsg::PonderStopped);
+    });
+
+    *ponder_pending = true;
+}
+
+// ============================================================
+// Search control
+// ============================================================
+
+fn stop_ponder(abort: &Arc<AtomicBool>, rx: &mpsc::Receiver<SearchMsg>, ponder_pending: &mut bool) {
+    if *ponder_pending {
+        abort.store(true, Ordering::SeqCst);
+        // Wait for PonderStopped message
+        loop {
+            match rx.recv() {
+                Ok(SearchMsg::PonderStopped) => break,
+                Ok(_) => {} // drain any other messages
+                Err(_) => break,
+            }
+        }
+        *ponder_pending = false;
+    }
+}
+
+// ============================================================
+// UCI Parsing
+// ============================================================
+
+fn parse_position(board: &mut Board, parts: &[&str], cmd: &str) {
     if parts.len() > 1 && parts[1] == "startpos" {
         *board = Board::starting_position();
     } else if parts.len() > 1 && parts[1] == "fen" {
-        let fen_str = cmd[13..].split("moves").next().unwrap().trim(); // Extract the FEN part before " moves "
-        *board = Board::from_fen(fen_str);
+        let fen_part = cmd[13..].split(" moves").next().unwrap_or("").trim();
+        *board = Board::from_fen(fen_part);
     }
-    let new_parts = cmd.split("moves").collect::<Vec<&str>>();
-    if new_parts.len() > 1 {
-        let moves_str = new_parts[1].trim();
-        for move_str in moves_str.split_whitespace() {
+
+    if let Some(moves_idx) = cmd.find(" moves ") {
+        for move_str in cmd[moves_idx + 7..].split_whitespace() {
             if let Some(m) = board.parse_uci_to_move(move_str) {
                 board.make_move(m);
             } else {
-                eprintln!("info string Error: Illegal move received: {}", move_str);
+                eprintln!("info string Error: Illegal move '{}'", move_str);
             }
         }
     }
 }
 
-fn handle_go(command: &str, board: Board) -> u64 {
-    let parts: Vec<&str> = command.split_whitespace().collect();
-
-    let bot_is_white = board.white_to_move;
-
-    // Default values if not found
-    let mut time = 30000; // 30s default
-    let mut inc = 0;
-
-    // Search the parts for the correct time label
-    let time_label = if bot_is_white { "wtime" } else { "btime" };
-    let inc_label = if bot_is_white { "winc" } else { "binc" };
-
-    if let Some(pos) = parts.iter().position(|&r| r == time_label) {
-        time = parts[pos + 1].parse().unwrap_or(30000);
-    }
-    if let Some(pos) = parts.iter().position(|&r| r == inc_label) {
-        inc = parts[pos + 1].parse().unwrap_or(0);
+fn parse_go(parts: &[&str], board: &Board) -> u64 {
+    if parts.contains(&"infinite") { return u64::MAX; }
+    if parts.contains(&"depth") { return u64::MAX; }
+    if let Some(val) = get_param(parts, "movetime") {
+        return val.saturating_sub(20);
     }
 
-    calculate_thinking_time(time, inc)
+    let (time_key, inc_key) = if board.white_to_move {
+        ("wtime", "winc")
+    } else {
+        ("btime", "binc")
+    };
+
+    let time = get_param(parts, time_key).unwrap_or(30000);
+    let inc = get_param(parts, inc_key).unwrap_or(0);
+    let moves_to_go = get_param(parts, "movestogo");
+
+    calculate_think_time(time, inc, moves_to_go)
 }
 
-pub fn calculate_thinking_time(available_time_ms: u64, increment_ms: u64) -> u64 {
-    // 1. Never use all your time. Keep a safety margin (e.g., 50ms) for network lag.
-    if available_time_ms < 100 {
-        return available_time_ms.saturating_sub(20);
+fn get_param(parts: &[&str], key: &str) -> Option<u64> {
+    parts.iter()
+        .position(|&p| p == key)
+        .and_then(|i| parts.get(i + 1))
+        .and_then(|v| v.parse().ok())
+}
+
+fn calculate_think_time(time_ms: u64, inc_ms: u64, moves_to_go: Option<u64>) -> u64 {
+    if time_ms < 100 {
+        return time_ms.saturating_sub(20);
     }
 
-    // 2. Estimate how many moves are left in the game.
-    // 30-40 is a standard "divisor" for mid-game.
-    let move_divisor = 30;
+    let divisor = match moves_to_go {
+        Some(mtg) if mtg > 0 => mtg.min(40),
+        _ => 25,
+    };
 
-    // 3. Basic formula: (Remaining Time / moves_left) + increment
-    // We subtract a small "overhead" buffer to be safe.
-    let base_time = available_time_ms / move_divisor;
-    let mut target_time = base_time + increment_ms;
+    let base = time_ms / divisor;
+    let mut target = base + (inc_ms * 3 / 4);
 
-    // 4. Emergency check: Don't spend more than 20% of your total remaining time on ONE move.
-    let max_safety_limit = available_time_ms / 5;
-    if target_time > max_safety_limit {
-        target_time = max_safety_limit;
+    let max_limit = time_ms / 4;
+    if target > max_limit {
+        target = max_limit;
     }
 
-    target_time.saturating_sub(50) // Subtract 50ms for Lichess/Bridge overhead
+    target.saturating_sub(30)
+}
+
+// ============================================================
+// Debug display
+// ============================================================
+
+fn print_board(board: &Board) {
+    let piece_char = |sq: usize| -> char {
+        let p = board.mailbox[sq];
+        if p == 0xFF { return '.'; }
+        let ch = match p & 0x07 {
+            1 => 'p', 2 => 'n', 3 => 'b', 4 => 'r', 5 => 'q', 6 => 'k', _ => '?',
+        };
+        if (p & 0x08) == 0 { ch.to_ascii_uppercase() } else { ch }
+    };
+
+    eprintln!();
+    for rank in (0..8).rev() {
+        eprint!("  {} ", rank + 1);
+        for file in 0..8 {
+            eprint!(" {}", piece_char(rank * 8 + file));
+        }
+        eprintln!();
+    }
+    eprintln!("     a b c d e f g h");
+    eprintln!("  FEN: {}", board.get_fen());
+    eprintln!("  Zobrist: {:016x}", board.zobrist_hash);
+    eprintln!();
 }
